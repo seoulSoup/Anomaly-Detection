@@ -1,0 +1,439 @@
+# -*- coding: utf-8 -*-
+# Set-Transformer one-class anomaly scoring for sets of shape (N, 1)
+# Focused on mean/variance shift. PyTorch only.
+
+import math
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def set_stats(x, mask=None):
+    """
+    x: [B, N, D]
+    mask: [B, N] (True for valid)
+    returns mean[B,D], std[B,D]
+    """
+    if mask is None:
+        m = x.mean(dim=1)
+        v = x.var(dim=1, unbiased=False).clamp_min(1e-12)
+        return m, v.sqrt()
+    else:
+        msum = (x * mask.unsqueeze(-1)).sum(dim=1)
+        count = mask.sum(dim=1).clamp_min(1)
+        m = msum / count.unsqueeze(-1)
+        diff2 = ((x - m.unsqueeze(1))**2) * mask.unsqueeze(-1)
+        v = diff2.sum(dim=1) / count.unsqueeze(-1)
+        return m, v.sqrt()
+
+def weak_augment(x, mask=None, jitter_std=0.02, drop_rate=0.1, scale_std=0.02, shift_std=0.02):
+    """
+    Mild augmentations that preserve identity of 'normal' sets while allowing contrastive learning.
+    x: [B,N,1], mask: [B,N] or None
+    """
+    B, N, D = x.shape
+    out = x.clone()
+
+    # (1) feature jitter
+    out = out + torch.randn_like(out) * jitter_std
+
+    # (2) per-set affine (tiny scale + shift)
+    scale = (1.0 + torch.randn(B, 1, 1, device=x.device) * scale_std).clamp(0.9, 1.1)
+    shift = torch.randn(B, 1, 1, device=x.device) * shift_std
+    out = out * scale + shift
+
+    # (3) random dropout of elements (masking)
+    if mask is None:
+        m = torch.ones(B, N, device=x.device, dtype=torch.bool)
+    else:
+        m = mask.clone()
+
+    if drop_rate > 0.0:
+        keep = (torch.rand(B, N, device=x.device) > drop_rate)
+        m = m & keep
+
+    return out, m
+
+def info_nce(z1, z2, temperature=0.2):
+    """
+    z1, z2: [B, H] matching pairs
+    """
+    z1 = F.normalize(z1, dim=-1)
+    z2 = F.normalize(z2, dim=-1)
+    B = z1.size(0)
+    logits = z1 @ z2.t() / temperature
+    labels = torch.arange(B, device=z1.device)
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
+# -----------------------------
+# Set Transformer blocks
+# (Lee et al., ICML 2019)
+# -----------------------------
+class MAB(nn.Module):
+    def __init__(self, dim_Q, dim_K, dim_V, h=4):
+        super().__init__()
+        self.h = h
+        self.fc_q = nn.Linear(dim_Q, dim_V)
+        self.fc_k = nn.Linear(dim_K, dim_V)
+        self.fc_v = nn.Linear(dim_K, dim_V)
+        self.fc_o = nn.Linear(dim_V, dim_V)
+        self.ln0 = nn.LayerNorm(dim_V)
+        self.ln1 = nn.LayerNorm(dim_V)
+        self.rff = nn.Sequential(
+            nn.Linear(dim_V, dim_V*2),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim_V*2, dim_V),
+        )
+
+    def forward(self, Q, K, mask_Q=None, mask_K=None):
+        # Q: [B,Nq,Dq], K: [B,Nk,Dk]
+        Q_ = self.fc_q(Q)
+        K_ = self.fc_k(K)
+        V_ = self.fc_v(K)
+
+        B, Nq, DV = Q_.shape
+        Nk = K_.size(1)
+        H = self.h
+        d = DV // H
+
+        def split_heads(x):
+            return x.view(B, -1, H, d).transpose(1, 2)  # [B,H,N, d]
+
+        Qh = split_heads(Q_)
+        Kh = split_heads(K_)
+        Vh = split_heads(V_)
+
+        att = (Qh @ Kh.transpose(-2, -1)) / math.sqrt(d)  # [B,H,Nq,Nk]
+        if mask_K is not None:
+            maskK = mask_K.unsqueeze(1).unsqueeze(2)  # [B,1,1,Nk]
+            att = att.masked_fill(~maskK, float('-inf'))
+        A = att.softmax(dim=-1)
+        Hout = A @ Vh  # [B,H,Nq,d]
+        Hout = Hout.transpose(1, 2).contiguous().view(B, Nq, DV)
+        Hout = self.ln0(Hout + Q_)
+        Hout2 = self.ln1(self.rff(Hout) + Hout)
+        return Hout2
+
+class SAB(nn.Module):
+    def __init__(self, dim_in, dim_out, h=4):
+        super().__init__()
+        self.mab = MAB(dim_in, dim_in, dim_out, h)
+
+    def forward(self, X, mask=None):
+        return self.mab(X, X, mask_Q=mask, mask_K=mask)
+
+class ISAB(nn.Module):
+    def __init__(self, dim_in, dim_out, m=64, h=4):
+        super().__init__()
+        self.I = nn.Parameter(torch.randn(m, dim_out))
+        self.mab0 = MAB(dim_out, dim_in, dim_out, h)
+        self.mab1 = MAB(dim_in, dim_out, dim_out, h)
+
+    def forward(self, X, mask=None):
+        B = X.size(0)
+        I = self.I.unsqueeze(0).expand(B, -1, -1)  # [B,m,dim_out]
+        H = self.mab0(I, X, mask_K=mask)           # [B,m,dim_out]
+        return self.mab1(X, H, mask_Q=mask)        # [B,N,dim_out]
+
+class PMA(nn.Module):
+    def __init__(self, dim, k=1, h=4):
+        super().__init__()
+        self.S = nn.Parameter(torch.randn(k, dim))
+        self.mab = MAB(dim, dim, dim, h)
+
+    def forward(self, X, mask=None):
+        B = X.size(0)
+        S = self.S.unsqueeze(0).expand(B, -1, -1)  # [B,k,dim]
+        return self.mab(S, X, mask_K=mask)         # [B,k,dim]
+
+# -----------------------------
+# Model
+# -----------------------------
+class SetEncoder(nn.Module):
+    def __init__(self, d_in=1, d_hid=128, n_isab=2, m_induce=64, heads=4):
+        super().__init__()
+        self.proj = nn.Linear(d_in, d_hid)
+        self.blocks = nn.ModuleList([ISAB(d_hid, d_hid, m=m_induce, h=heads) for _ in range(n_isab)])
+        self.pma = PMA(d_hid, k=1, h=heads)  # set embedding
+        # element stream available for reconstruction
+    def forward(self, X, mask=None):
+        X = self.proj(X)
+        for blk in self.blocks:
+            X = blk(X, mask=mask)        # [B,N,H]
+        Z_set = self.pma(X, mask=mask)[:, 0, :]  # [B,H]
+        return X, Z_set
+
+class ElemDecoder(nn.Module):
+    def __init__(self, d_hid=128, d_out=1):
+        super().__init__()
+        self.dec = nn.Sequential(
+            nn.Linear(d_hid, d_hid),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_hid, d_out),
+        )
+    def forward(self, Z_elems):
+        return self.dec(Z_elems)  # [B,N,1]
+
+class StatHead(nn.Module):
+    """Predict set mean and std from set embedding."""
+    def __init__(self, d_hid=128, d_out=2):  # (mu, sigma)
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_hid, d_hid),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_hid, d_out),
+        )
+    def forward(self, z_set):
+        out = self.mlp(z_set)  # [B,2]
+        mu_hat = out[:, :1]
+        # enforce positive std via softplus
+        sigma_hat = F.softplus(out[:, 1:2]) + 1e-6
+        return mu_hat, sigma_hat
+
+class OneClassSetModel(nn.Module):
+    def __init__(self, d_in=1, d_hid=128, n_isab=2, m_induce=64, heads=4):
+        super().__init__()
+        self.encoder = SetEncoder(d_in, d_hid, n_isab, m_induce, heads)
+        self.decoder = ElemDecoder(d_hid, d_in)
+        self.stat_head = StatHead(d_hid, 2)
+        self.register_buffer("center", torch.zeros(d_hid))
+
+    def forward(self, X, mask=None):
+        Z_elems, Z_set = self.encoder(X, mask=mask)
+        X_hat = self.decoder(Z_elems)
+        mu_hat, sigma_hat = self.stat_head(Z_set)
+        return X_hat, Z_elems, Z_set, mu_hat, sigma_hat
+
+# -----------------------------
+# Dataset (toy normal sets)
+# Replace with your own loader. This generates many normal sets with (N,1).
+# -----------------------------
+class NormalSetDataset(Dataset):
+    def __init__(self, num_sets=2000, n_min=8000, n_max=15000, mu_range=(-0.2, 0.2), sigma_range=(0.8, 1.2), seed=7):
+        super().__init__()
+        rng = random.Random(seed)
+        self.sets = []
+        for _ in range(num_sets):
+            n = rng.randint(n_min, n_max)
+            mu = rng.uniform(*mu_range)
+            sigma = rng.uniform(*sigma_range)
+            arr = torch.randn(n, 1) * sigma + mu
+            self.sets.append(arr)
+    def __len__(self):
+        return len(self.sets)
+    def __getitem__(self, idx):
+        X = self.sets[idx]
+        return X
+
+def collate_variable_sets(batch, max_subset=2048):
+    """
+    batch: list of tensors [N_i, 1]
+    We randomly subsample up to max_subset elements per set for memory efficiency.
+    Returns:
+        X: [B, N_max, 1], mask: [B, N_max]
+    """
+    B = len(batch)
+    Ns = [x.shape[0] for x in batch]
+    n_take = min(max_subset, max(Ns))
+    X_list, M_list = [], []
+    for x in batch:
+        n = x.shape[0]
+        if n > n_take:
+            idx = torch.randperm(n)[:n_take]
+            xi = x[idx]
+            mi = torch.ones(n_take, dtype=torch.bool)
+        else:
+            pad = n_take - n
+            xi = torch.cat([x, torch.zeros(pad, 1)], dim=0)
+            mi = torch.tensor([True]*n + [False]*pad, dtype=torch.bool)
+        X_list.append(xi)
+        M_list.append(mi)
+    X = torch.stack(X_list, dim=0)     # [B, n_take, 1]
+    mask = torch.stack(M_list, dim=0)  # [B, n_take]
+    return X, mask
+
+# -----------------------------
+# Training
+# -----------------------------
+def train(
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    epochs=10,
+    batch_size=8,
+    d_hid=128,
+    max_subset=2048,
+    w_recon=1.0,
+    w_svdd=1.0,
+    w_con=0.5,
+    w_stats=1.0,
+):
+    ds = NormalSetDataset()
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                    collate_fn=lambda b: collate_variable_sets(b, max_subset=max_subset))
+
+    model = OneClassSetModel(d_in=1, d_hid=d_hid, n_isab=2, m_induce=64, heads=4).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=2e-4, weight_decay=1e-5)
+
+    # Warm-up: estimate center from a few batches
+    model.center.zero_()
+    with torch.no_grad():
+        cnt = 0
+        for X, mask in dl:
+            X = X.to(device); mask = mask.to(device)
+            _, _, Z_set, _, _ = model(X, mask)
+            model.center += Z_set.mean(dim=0)
+            cnt += 1
+            if cnt >= 10:
+                break
+        model.center /= max(cnt, 1)
+
+    for ep in range(1, epochs+1):
+        model.train()
+        tot = 0.0
+        for X, mask in dl:
+            X = X.to(device); mask = mask.to(device)
+
+            # two weak augmentations for contrastive
+            X1, m1 = weak_augment(X, mask, jitter_std=0.01, drop_rate=0.1, scale_std=0.01, shift_std=0.01)
+            X2, m2 = weak_augment(X, mask, jitter_std=0.01, drop_rate=0.1, scale_std=0.01, shift_std=0.01)
+
+            # forward (branch 1)
+            X1_hat, Z1_elems, Z1_set, mu1_hat, sigma1_hat = model(X1, mask=m1)
+
+            # losses
+            # recon on valid elements
+            L_recon = ( (X1 - X1_hat).abs() * m1.unsqueeze(-1) ).sum() / m1.sum().clamp_min(1)
+
+            # Deep-SVDD on set embedding
+            L_svdd = ((Z1_set - model.center)**2).sum(dim=1).mean()
+
+            # contrastive on set embedding
+            with torch.no_grad():
+                _, _, Z2_set, _, _ = model(X2, mask=m2)
+            L_con = info_nce(Z1_set, Z2_set)
+
+            # stat head MSE: predict true μ, σ of the (masked) set
+            mu_true, sigma_true = set_stats(X1, mask=m1)
+            L_stats = F.mse_loss(mu1_hat, mu_true) + F.mse_loss(sigma1_hat, sigma_true)
+
+            loss = w_recon*L_recon + w_svdd*L_svdd + w_con*L_con + w_stats*L_stats
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            tot += loss.item()
+
+        # update center (running mean) using a few fresh batches
+        with torch.no_grad():
+            acc = 0; cnt = 0
+            for X, mask in dl:
+                X = X.to(device); mask = mask.to(device)
+                _, _, Z_set, _, _ = model(X, mask)
+                acc += Z_set.mean(dim=0)
+                cnt += 1
+                if cnt >= 5: break
+            model.center = 0.9*model.center + 0.1*(acc/max(cnt,1))
+
+        print(f"[Epoch {ep}] loss={tot/len(dl):.4f}")
+
+    return model
+
+# -----------------------------
+# Inference scoring
+# -----------------------------
+@torch.no_grad()
+def score_set(model, X_np_or_torch, device=None, max_subset=4096, return_element_scores=True):
+    """
+    X_np_or_torch: tensor [N,1] (N<100 for your case)
+    Returns:
+      set_score (float),
+      dict with components,
+      element_scores [N] if requested
+    """
+    if not torch.is_tensor(X_np_or_torch):
+        X = torch.tensor(X_np_or_torch, dtype=torch.float32)
+    else:
+        X = X_np_or_torch.float()
+    X = X.unsqueeze(0)  # [1,N,1]
+    N = X.size(1)
+    if device is None:
+        device = next(model.parameters()).device
+
+    # pad or sample to max_subset (not needed for small N<100, but keep generic)
+    if N > max_subset:
+        idx = torch.randperm(N)[:max_subset]
+        Xs = X[:, idx]
+        mask = torch.ones(1, max_subset, dtype=torch.bool)
+    else:
+        pad = max_subset - N
+        Xs = torch.cat([X, torch.zeros(1, pad, 1)], dim=1)
+        mask = torch.tensor([True]*N + [False]*pad, dtype=torch.bool).unsqueeze(0)
+
+    Xs = Xs.to(device); mask = mask.to(device)
+
+    X_hat, Z_elems, Z_set, mu_hat, sigma_hat = model(Xs, mask=mask)
+
+    # element reconstruction score on valid
+    recon_err = ( (Xs - X_hat).abs() * mask.unsqueeze(-1) )
+    recon_mean = recon_err.sum() / mask.sum().clamp_min(1)
+
+    # svdd distance
+    svdd_dist = ((Z_set - model.center)**2).sum(dim=1).sqrt().mean()
+
+    # stat head deviation (μ, σ)
+    mu_true, sigma_true = set_stats(Xs, mask=mask)
+    stat_err = F.l1_loss(mu_hat, mu_true) + F.l1_loss(sigma_hat, sigma_true)
+
+    # final score (tune weights to your taste)
+    alpha, beta, gamma = 1.0, 1.0, 2.0  # give more weight to statistics (mean/std)
+    set_score = (alpha*svdd_dist + beta*recon_mean + gamma*stat_err).item()
+
+    elem_scores = None
+    if return_element_scores:
+        # project back to original N
+        if N <= max_subset:
+            elem_scores = recon_err[0, :N, 0].cpu()
+        else:
+            # if we downsampled, we only have subset scores; map back (here we just return subset)
+            elem_scores = recon_err[0, :, 0].cpu()
+
+    parts = dict(
+        svdd_dist=float(svdd_dist.item()),
+        recon_mean=float(recon_mean.item()),
+        stat_err=float(stat_err.item()),
+        mu_hat=float(mu_hat.item()),
+        sigma_hat=float(sigma_hat.item()),
+        mu_true=float(mu_true.item()),
+        sigma_true=float(sigma_true.item()),
+    )
+    return set_score, parts, elem_scores
+
+# -----------------------------
+# Demo (optional)
+# -----------------------------
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = train(device=device, epochs=6, batch_size=6, d_hid=128, max_subset=2048)
+
+    # Build a 'normal' small inference set (N<100)
+    N = 80
+    normal = torch.randn(N,1) * 1.0 + 0.0
+
+    # mean-shifted set
+    shifted_mean = torch.randn(N,1) * 1.0 + 0.5
+
+    # var-increased set
+    shifted_var = torch.randn(N,1) * 1.5 + 0.0
+
+    # both-shifted
+    shifted_both = torch.randn(N,1) * 1.5 + 0.5
+
+    for name, X in [("normal", normal), ("mean+", shifted_mean), ("var+", shifted_var), ("both+", shifted_both)]:
+        s, parts, _ = score_set(model, X, device=device)
+        print(f"{name:8s} -> score={s:.4f} | parts={parts}")
