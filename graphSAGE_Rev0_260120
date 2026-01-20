@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv
+
+
+def matrix_to_4n_graph(values: torch.Tensor, coords: torch.Tensor | None = None) -> Data:
+    """
+    4-neighborhood(상하좌우) 격자 그래프 생성 (양방향).
+    edge_attr 없음.
+
+    values: (H, W) float tensor (각 셀 스칼라)
+    coords : (H, W, 2) float tensor (각 셀 (x,y)) - 선택.
+             주면 노드 feature에 포함, 없으면 스칼라만 사용.
+
+    return: PyG Data
+      - x: (N, 1) 또는 (N, 3) = [scalar] or [scalar, x, y]
+      - pos: (N, 2) (coords 주면)
+      - edge_index: (2, E) (양방향)
+    """
+    assert values.dim() == 2
+    H, W = values.shape
+    N = H * W
+
+    # (r,c) -> node_id
+    def nid(r, c):
+        return r * W + c
+
+    vals_flat = values.reshape(N, 1).to(torch.float32)
+
+    pos = None
+    if coords is not None:
+        assert coords.shape == (H, W, 2)
+        pos = coords.reshape(N, 2).to(torch.float32)
+        x = torch.cat([vals_flat, pos], dim=-1)  # (N, 3)
+    else:
+        x = vals_flat  # (N, 1)
+
+    # 엣지(상하좌우) - 양방향
+    src, dst = [], []
+    for r in range(H):
+        for c in range(W):
+            i = nid(r, c)
+            # right neighbor
+            if c + 1 < W:
+                j = nid(r, c + 1)
+                src += [i, j]
+                dst += [j, i]
+            # down neighbor
+            if r + 1 < H:
+                j = nid(r + 1, c)
+                src += [i, j]
+                dst += [j, i]
+
+    if len(src) == 0:
+        # (1,1)인 경우 edge 없음
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    else:
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+
+    data = Data(x=x, edge_index=edge_index)
+    if pos is not None:
+        data.pos = pos
+    return data
+
+
+class GraphSAGE(nn.Module):
+    """
+    PyG SAGEConv 기반 GraphSAGE.
+    - 입력: data.x, data.edge_index
+    - 출력: 노드 임베딩 (N, hidden) 또는 (N, out_dim)
+    """
+    def __init__(self, in_dim: int, hidden: int = 64, out_dim: int | None = None,
+                 num_layers: int = 2, dropout: float = 0.0):
+        super().__init__()
+        assert num_layers >= 1
+
+        if out_dim is None:
+            out_dim = hidden
+
+        self.dropout = dropout
+        self.convs = nn.ModuleList()
+
+        if num_layers == 1:
+            self.convs.append(SAGEConv(in_dim, out_dim))
+        else:
+            self.convs.append(SAGEConv(in_dim, hidden))
+            for _ in range(num_layers - 2):
+                self.convs.append(SAGEConv(hidden, hidden))
+            self.convs.append(SAGEConv(hidden, out_dim))
+
+    def forward(self, data: Data) -> torch.Tensor:
+        x, edge_index = data.x, data.edge_index
+
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            if i != len(self.convs) - 1:
+                x = F.relu(x)
+                if self.dropout > 0:
+                    x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
+
+# -------------------------
+# 사용 예시
+# -------------------------
+if __name__ == "__main__":
+    H, W = 1, 4  # 행/열 1도 OK
+    values = torch.randn(H, W)
+
+    coords = torch.stack(torch.meshgrid(
+        torch.arange(H), torch.arange(W), indexing="ij"
+    ), dim=-1).float()  # (H,W,2)
+
+    data = matrix_to_4n_graph(values, coords=coords)  # x: (N,3)
+
+    model = GraphSAGE(in_dim=data.x.size(-1), hidden=64, out_dim=64, num_layers=3, dropout=0.1)
+    emb = model(data)               # (N, 64)
+    emb_map = emb.view(H, W, -1)    # 다시 매트릭스로
+    print(data)
+    print(emb.shape, emb_map.shape)
