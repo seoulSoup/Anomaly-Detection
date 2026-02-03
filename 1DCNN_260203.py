@@ -1,17 +1,16 @@
 # ============================================================
-# 1D-CNN (set-like) Encoder + MLP Binary Classifier (Pass/Fail)
-# - Input: variable-length set W of 3D vectors [score, x, y]
-#   Each sample: (W_i, 3)
-# - Batch: padded to max W in batch + mask
-# - Model: Conv1d over W dimension + masked global pooling
+# CNN2D Encoder + MLP Binary Classifier (Pass/Fail)
+# - Dataset: list of N samples, each is a 3D tensor (B, W, 3)
+#   where B and W are variable and MUST NOT be mixed across samples.
+# - Training batching: we batch samples by padding to (Bmax, Wmax)
+# - Model: Conv2d over spatial (B, W) with 3 input channels
+# - Pooling: masked global avg/max pooling -> fixed vector
 # - Loss: Focal Loss (logits-based)
-# - Train: monitors Precision / Recall / F1 on validation
-#   using logits -> criterion(threshold) -> pass/fail
+# - Validation: logits -> threshold -> pass/fail, then Precision/Recall/F1
 # ============================================================
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Any
-import math
+from typing import List, Tuple, Optional, Dict
 import random
 
 import torch
@@ -21,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # ----------------------------
-# Utilities: metrics
+# Metrics
 # ----------------------------
 @torch.no_grad()
 def precision_recall_f1_from_preds(
@@ -43,33 +42,35 @@ def precision_recall_f1_from_preds(
 
 
 # ----------------------------
-# Collate: pad variable W + mask
+# Collate: pad variable (B, W) + mask
 # ----------------------------
-def collate_set_batch(
+def collate_bwl_batch(
     batch: List[Tuple[torch.Tensor, int]],
     pad_value: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     batch: list of (X_i, y_i)
-      - X_i: Tensor (W_i, 3)
-      - y_i: int (0/1)
+      - X_i: FloatTensor (B_i, W_i, 3)  [score, x, y]
+      - y_i: int 0/1
     returns:
-      X: (B, Wmax, 3)
-      mask: (B, Wmax) with 1 for valid positions else 0
-      y: (B,)
+      X: (Nbatch, Bmax, Wmax, 3)
+      mask: (Nbatch, Bmax, Wmax) bool (True=valid)
+      y: (Nbatch,)
     """
     xs, ys = zip(*batch)
-    B = len(xs)
-    Wmax = max(x.shape[0] for x in xs)
+    nb = len(xs)
+    Bmax = max(x.shape[0] for x in xs)
+    Wmax = max(x.shape[1] for x in xs)
 
-    X = xs[0].new_full((B, Wmax, 3), fill_value=pad_value)
-    mask = xs[0].new_zeros((B, Wmax), dtype=torch.bool)
+    X = xs[0].new_full((nb, Bmax, Wmax, 3), fill_value=pad_value)
+    mask = xs[0].new_zeros((nb, Bmax, Wmax), dtype=torch.bool)
     y = torch.tensor(ys, dtype=torch.long)
 
     for i, x in enumerate(xs):
-        w = x.shape[0]
-        X[i, :w] = x
-        mask[i, :w] = True
+        b, w, c = x.shape
+        assert c == 3, f"Expected last dim=3 but got {c}"
+        X[i, :b, :w] = x
+        mask[i, :b, :w] = True
 
     return X, mask, y
 
@@ -79,11 +80,9 @@ def collate_set_batch(
 # ----------------------------
 class BinaryFocalLossWithLogits(nn.Module):
     """
-    Focal loss for binary classification, operating on logits.
-    - alpha: class balancing (float in [0,1]) or None
-             If float, applied to positive class weight alpha, negative weight (1-alpha)
-    - gamma: focusing parameter
-    - reduction: 'mean' | 'sum' | 'none'
+    Focal loss for binary classification with logits.
+    alpha: Optional[float] in [0,1] (pos weight alpha, neg weight 1-alpha) or None
+    gamma: focusing parameter
     """
     def __init__(self, alpha: Optional[float] = 0.25, gamma: float = 2.0, reduction: str = "mean"):
         super().__init__()
@@ -96,23 +95,16 @@ class BinaryFocalLossWithLogits(nn.Module):
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        logits: (B,) or (B,1)
-        targets: (B,) int/float {0,1}
-        """
         logits = logits.view(-1)
         targets = targets.float().view(-1)
 
-        # BCE with logits per element
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        # pt = exp(-bce) is probability of correct class
-        pt = torch.exp(-bce)
-
-        # focal modulation
+        pt = torch.exp(-bce)  # prob of correct class
         focal = (1.0 - pt) ** self.gamma
 
         if self.alpha is not None:
-            alpha_t = torch.where(targets > 0.5, torch.full_like(targets, self.alpha),
+            alpha_t = torch.where(targets > 0.5,
+                                  torch.full_like(targets, self.alpha),
                                   torch.full_like(targets, 1.0 - self.alpha))
             loss = alpha_t * focal * bce
         else:
@@ -126,46 +118,45 @@ class BinaryFocalLossWithLogits(nn.Module):
 
 
 # ----------------------------
-# Masked pooling helpers
+# Masked pooling for 2D
 # ----------------------------
-def masked_avg_pool_1d(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def masked_avg_pool_2d(feat: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
-    x: (B, C, W)
-    mask: (B, W) bool
-    returns: (B, C)
+    feat: (N, C, B, W)
+    mask: (N, B, W) bool
+    returns: (N, C)
     """
-    mask_f = mask.unsqueeze(1).float()  # (B,1,W)
-    x_masked = x * mask_f
-    denom = mask_f.sum(dim=2).clamp_min(1.0)  # (B,1)
-    return x_masked.sum(dim=2) / denom
+    mask_f = mask.unsqueeze(1).float()  # (N,1,B,W)
+    feat = feat * mask_f
+    denom = mask_f.sum(dim=(2, 3)).clamp_min(1.0)  # (N,1)
+    return feat.sum(dim=(2, 3)) / denom
 
-def masked_max_pool_1d(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def masked_max_pool_2d(feat: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
-    x: (B, C, W)
-    mask: (B, W) bool
-    returns: (B, C)
+    feat: (N, C, B, W)
+    mask: (N, B, W) bool
+    returns: (N, C)
     """
-    # set padded positions to very negative so max ignores them
-    neg_inf = torch.finfo(x.dtype).min
-    mask_expand = mask.unsqueeze(1)  # (B,1,W)
-    x_masked = x.masked_fill(~mask_expand, neg_inf)
-    return x_masked.max(dim=2).values
+    neg_inf = torch.finfo(feat.dtype).min
+    mask_exp = mask.unsqueeze(1)  # (N,1,B,W)
+    feat = feat.masked_fill(~mask_exp, neg_inf)
+    return feat.amax(dim=(2, 3))
 
 
 # ----------------------------
-# Model: 1D CNN Encoder + MLP Head
+# Model: CNN2D Encoder + MLP head
 # ----------------------------
-class ConvBlock1D(nn.Module):
+class ConvBlock2D(nn.Module):
     def __init__(self, cin: int, cout: int, k: int = 3, dropout: float = 0.1):
         super().__init__()
         pad = k // 2
-        self.conv1 = nn.Conv1d(cin, cout, kernel_size=k, padding=pad, bias=False)
-        self.bn1 = nn.BatchNorm1d(cout)
-        self.conv2 = nn.Conv1d(cout, cout, kernel_size=k, padding=pad, bias=False)
-        self.bn2 = nn.BatchNorm1d(cout)
+        self.conv1 = nn.Conv2d(cin, cout, kernel_size=k, padding=pad, bias=False)
+        self.bn1 = nn.BatchNorm2d(cout)
+        self.conv2 = nn.Conv2d(cout, cout, kernel_size=k, padding=pad, bias=False)
+        self.bn2 = nn.BatchNorm2d(cout)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
-        self.skip = nn.Identity() if cin == cout else nn.Conv1d(cin, cout, kernel_size=1, bias=False)
+        self.skip = nn.Identity() if cin == cout else nn.Conv2d(cin, cout, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.conv1(x)
@@ -179,19 +170,13 @@ class ConvBlock1D(nn.Module):
         return y
 
 
-class CNNSetBinaryClassifier(nn.Module):
+class CNN2DPassFail(nn.Module):
     """
     Input:
-      X: (B, W, 3) where 3=[score, x, y]
-      mask: (B, W) bool
+      X: (N, B, W, 3)  where 3=[score, x, y]
+      mask: (N, B, W) bool
     Output:
-      logits: (B,)
-    Notes:
-      - W is a set, but we still apply Conv1d on the padded "W axis".
-        Since it's unordered, Conv is a heuristic feature extractor.
-        We reduce order-dependence by:
-          (a) using only global pooling at the end,
-          (b) optionally shuffling W order per sample during training outside the model (recommended).
+      logits: (N,)
     """
     def __init__(
         self,
@@ -206,12 +191,13 @@ class CNNSetBinaryClassifier(nn.Module):
         self.use_score_log1p = use_score_log1p
         self.add_score_stats = add_score_stats
 
+        # 3 input channels
         self.stem = nn.Sequential(
-            nn.Conv1d(3, base, kernel_size=1, bias=False),
-            nn.BatchNorm1d(base),
+            nn.Conv2d(3, base, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base),
             nn.GELU(),
         )
-        self.blocks = nn.Sequential(*[ConvBlock1D(base, base, k=k, dropout=dropout) for _ in range(depth)])
+        self.blocks = nn.Sequential(*[ConvBlock2D(base, base, k=k, dropout=dropout) for _ in range(depth)])
 
         score_feat_dim = base // 2 if add_score_stats else 0
         if add_score_stats:
@@ -228,66 +214,48 @@ class CNNSetBinaryClassifier(nn.Module):
         )
 
     def forward(self, X: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # X: (B,W,3), mask: (B,W)
-        score = X[..., 0]          # (B,W)
-        xy = X[..., 1:3]           # (B,W,2)
+        # X: (N,B,W,3)
+        score = X[..., 0]    # (N,B,W)
+        xy = X[..., 1:3]     # (N,B,W,2)
 
         if self.use_score_log1p:
-            # If score is non-negative anomaly score, log1p stabilizes large values
             score_stable = torch.log1p(torch.clamp(score, min=0.0))
         else:
             score_stable = score
 
-        X2 = torch.cat([score_stable.unsqueeze(-1), xy], dim=-1)  # (B,W,3)
-        x = X2.permute(0, 2, 1).contiguous()  # (B,3,W)
+        X2 = torch.cat([score_stable.unsqueeze(-1), xy], dim=-1)  # (N,B,W,3)
+
+        # Conv2d expects (N, C, H, W) => here H=B, W=W
+        x = X2.permute(0, 3, 1, 2).contiguous()  # (N,3,B,W)
 
         x = self.stem(x)
         x = self.blocks(x)
 
-        avg = masked_avg_pool_1d(x, mask)  # (B,base)
-        mx = masked_max_pool_1d(x, mask)   # (B,base)
+        avg = masked_avg_pool_2d(x, mask)  # (N,base)
+        mx  = masked_max_pool_2d(x, mask)  # (N,base)
 
         feats = [avg, mx]
 
         if self.add_score_stats:
-            # stats computed only over valid positions
+            # stats over valid cells only
             mask_f = mask.float()
-            denom = mask_f.sum(dim=1).clamp_min(1.0)
-            s_mean = (score_stable * mask_f).sum(dim=1) / denom  # (B,)
-            # max over valid positions
+            denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0)  # (N,)
+
+            s_mean = (score_stable * mask_f).sum(dim=(1, 2)) / denom  # (N,)
+
             neg_inf = torch.finfo(score_stable.dtype).min
-            s_max = score_stable.masked_fill(~mask, neg_inf).max(dim=1).values  # (B,)
-            s_feat = self.score_head(torch.stack([s_mean, s_max], dim=1))       # (B,base//2)
+            s_max = score_stable.masked_fill(~mask, neg_inf).amax(dim=(1, 2))  # (N,)
+
+            s_feat = self.score_head(torch.stack([s_mean, s_max], dim=1))  # (N,base//2)
             feats.append(s_feat)
 
         h = torch.cat(feats, dim=1)
-        logits = self.head(h).squeeze(-1)  # (B,)
+        logits = self.head(h).squeeze(-1)  # (N,)
         return logits
 
 
 # ----------------------------
-# Optional: per-sample set shuffling (recommended)
-# ----------------------------
-@torch.no_grad()
-def shuffle_set_in_batch(X: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Shuffles the valid W positions per sample to reduce order bias.
-    X: (B,W,3), mask: (B,W)
-    """
-    B, W, C = X.shape
-    X_out = X.clone()
-    mask_out = mask.clone()
-    for i in range(B):
-        valid_idx = torch.nonzero(mask[i], as_tuple=False).squeeze(-1)
-        if valid_idx.numel() <= 1:
-            continue
-        perm = valid_idx[torch.randperm(valid_idx.numel(), device=valid_idx.device)]
-        X_out[i, valid_idx] = X[i, perm]
-    return X_out, mask_out
-
-
-# ----------------------------
-# Training config + train loop
+# Training
 # ----------------------------
 @dataclass
 class TrainConfig:
@@ -297,16 +265,12 @@ class TrainConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
 
-    # focal loss
     focal_alpha: Optional[float] = 0.25
     focal_gamma: float = 2.0
 
-    # decision threshold on logits:
+    # logits threshold:
     # logits >= 0  <=> sigmoid(logits) >= 0.5
     logit_threshold: float = 0.0
-
-    # set shuffle augmentation
-    shuffle_sets: bool = True
 
 
 def train_model(
@@ -331,16 +295,12 @@ def train_model(
     for epoch in range(1, cfg.epochs + 1):
         # ---- Train ----
         model.train()
-        total_loss = 0.0
-        n_batches = 0
+        total_loss, n_batches = 0.0, 0
 
         for X, mask, y in train_loader:
             X = X.to(cfg.device)
             mask = mask.to(cfg.device)
             y = y.to(cfg.device)
-
-            if cfg.shuffle_sets:
-                X, mask = shuffle_set_in_batch(X, mask)
 
             logits = model(X, mask)
             loss = criterion(logits, y)
@@ -348,7 +308,7 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
-            if cfg.grad_clip is not None and cfg.grad_clip > 0:
+            if cfg.grad_clip and cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
 
             optimizer.step()
@@ -361,11 +321,8 @@ def train_model(
 
         # ---- Validation (logits -> threshold -> pass/fail) ----
         model.eval()
-        val_total_loss = 0.0
-        val_batches = 0
-
-        all_true = []
-        all_pred = []
+        val_total_loss, val_batches = 0.0, 0
+        all_true, all_pred = [], []
 
         with torch.no_grad():
             for X, mask, y in val_loader:
@@ -376,7 +333,6 @@ def train_model(
                 logits = model(X, mask)
                 loss = criterion(logits, y)
 
-                # Convert logits to pass/fail using threshold on logits directly
                 pred = (logits >= cfg.logit_threshold).long()
 
                 val_total_loss += loss.item()
@@ -404,63 +360,75 @@ def train_model(
 
 
 # ============================================================
-# Example usage (replace with your Dataset)
+# Example dataset wrapper for your "list of tensors"
 # ============================================================
-class ExampleSetDataset(Dataset):
+class ListTensorDataset(Dataset):
     """
-    Dummy dataset example.
-    Replace __getitem__ to return:
-      X_i: FloatTensor (W_i, 3)
-      y_i: int 0/1
+    tensors: List[Tensor] where each Tensor is (B, W, 3)
+    labels:  List[int] (0/1)
     """
-    def __init__(self, n: int = 1000, w_min: int = 1, w_max: int = 40, pos_rate: float = 0.1):
-        super().__init__()
-        self.n = n
-        self.w_min = w_min
-        self.w_max = w_max
-        self.pos_rate = pos_rate
+    def __init__(self, tensors: List[torch.Tensor], labels: List[int]):
+        assert len(tensors) == len(labels)
+        self.tensors = tensors
+        self.labels = labels
 
-    def __len__(self):
-        return self.n
+    def __len__(self) -> int:
+        return len(self.tensors)
 
-    def __getitem__(self, idx: int):
-        W = random.randint(self.w_min, self.w_max)
-        # score: non-normalized anomaly-like positive values
-        score = torch.rand(W) * 10.0
-        xy = torch.rand(W, 2) * 2.0 - 1.0
-        X = torch.cat([score.unsqueeze(-1), xy], dim=1).float()
-
-        y = 1 if random.random() < self.pos_rate else 0
-        # make positives have higher max score (toy signal)
-        if y == 1:
-            X[random.randrange(W), 0] += 20.0
-        return X, y
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        x = self.tensors[idx].float()
+        y = int(self.labels[idx])
+        assert x.dim() == 3 and x.size(-1) == 3, f"Expected (B,W,3), got {tuple(x.shape)}"
+        return x, y
 
 
+# ============================================================
+# Minimal runnable demo (remove in your project)
+# ============================================================
 if __name__ == "__main__":
-    # Build loaders
-    train_ds = ExampleSetDataset(n=2000, pos_rate=0.12)
-    val_ds = ExampleSetDataset(n=500, pos_rate=0.12)
+    # Dummy data: N samples, each is (B,W,3) with variable B/W
+    N = 300
+    tensors = []
+    labels = []
+    for _ in range(N):
+        B = random.randint(1, 25)
+        W = random.randint(1, 40)
+        score = torch.rand(B, W) * 10.0          # anomaly score-like
+        xy = torch.rand(B, W, 2) * 2.0 - 1.0     # normalized coords example
+        x = torch.cat([score.unsqueeze(-1), xy], dim=-1)  # (B,W,3)
+
+        y = 1 if random.random() < 0.15 else 0
+        if y == 1:
+            # inject a high-score anomaly cell
+            bi = random.randrange(B)
+            wi = random.randrange(W)
+            x[bi, wi, 0] += 20.0
+        tensors.append(x)
+        labels.append(y)
+
+    # Split
+    split = int(0.8 * N)
+    train_ds = ListTensorDataset(tensors[:split], labels[:split])
+    val_ds = ListTensorDataset(tensors[split:], labels[split:])
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=32,
+        batch_size=16,
         shuffle=True,
         num_workers=0,
-        collate_fn=collate_set_batch,
+        collate_fn=collate_bwl_batch,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=64,
+        batch_size=32,
         shuffle=False,
         num_workers=0,
-        collate_fn=collate_set_batch,
+        collate_fn=collate_bwl_batch,
         pin_memory=torch.cuda.is_available(),
     )
 
-    # Model
-    model = CNNSetBinaryClassifier(
+    model = CNN2DPassFail(
         base=64,
         depth=4,
         k=3,
@@ -469,15 +437,13 @@ if __name__ == "__main__":
         add_score_stats=True,
     )
 
-    # Train
     cfg = TrainConfig(
         epochs=10,
         lr=1e-3,
         weight_decay=1e-4,
         focal_alpha=0.25,
         focal_gamma=2.0,
-        logit_threshold=0.0,  # logits>=0 => anomaly(1), else normal(0)
-        shuffle_sets=True,
+        logit_threshold=0.0,
     )
 
     history = train_model(model, train_loader, val_loader, cfg)
