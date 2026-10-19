@@ -1,4 +1,4 @@
-
+9
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -277,3 +277,37 @@ matched[columns].to_csv(
 )
 
 ab_results = matched.copy()
+
+
+/////////////////////
+
+import numpy as np
+
+h = ab_results["H_count"].to_numpy(dtype=float)
+d = ab_results["D_fF"].to_numpy(dtype=float)
+
+# 동일 High 개수별 평균
+print("H count | Mean D (fF) | Std D (fF) | N")
+for n in np.unique(h):
+    v = d[h == n]
+    print(
+        f"{int(n):7d} | "
+        f"{v.mean():11.2f} | "
+        f"{v.std():10.2f} | "
+        f"{len(v)}"
+    )
+
+# 1차 함수와 2차 함수 비교 (진단용)
+p1 = np.polyfit(h, d, 1)
+p2 = np.polyfit(h, d, 2)
+
+rmse1 = np.sqrt(np.mean((d - np.polyval(p1, h))**2))
+rmse2 = np.sqrt(np.mean((d - np.polyval(p2, h))**2))
+
+print("\nLinear RMSE :", rmse1, "fF")
+print("Quadratic RMSE:", rmse2, "fF")
+print("Quadratic coefficients:", p2)
+
+if p2[0] < 0:
+    peak = -p2[1] / (2 * p2[0])
+    print("Estimated peak H count:", peak)
