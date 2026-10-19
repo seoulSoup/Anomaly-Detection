@@ -402,3 +402,59 @@ pin_fit_new = {
     "optimization": result,
     "line_fF": line_fF
 }
+
+
+///////////////////////////0
+import numpy as np
+import pandas as pd
+
+rows = []
+
+for k in test:
+    g = group_ids[k]
+    ref = train[group_ids[train] == g]
+
+    base_mean = target_fF[ref].mean()
+    offset = (target_fF[ref] - line_fF[ref]).mean()
+
+    pred = offset + line_fF[k]
+    residual = target_fF[k] - pred
+
+    rows.append({
+        "index": int(k),
+        "signature": str(data.loc[k, "signature"]),
+        "High": data.loc[k, "high_pins"],
+        "Low": data.loc[k, "low_pins"],
+        "line_delta_fF": line_fF[k] - line_fF[ref].mean(),
+        "measured_delta_fF": target_fF[k] - base_mean,
+        "residual_fF": residual,
+        "abs_error_fF": abs(residual)
+    })
+
+diagnostics = pd.DataFrame(rows)
+
+print("=== TEST ERROR QUANTILES ===")
+print(
+    diagnostics["abs_error_fF"].quantile(
+        [0.50, 0.75, 0.90, 0.95, 0.99, 1.00]
+    )
+)
+
+print("\n=== TOP 10 TEST ERRORS ===")
+print(
+    diagnostics.sort_values(
+        "abs_error_fF", ascending=False
+    ).head(10).to_string(index=False)
+)
+
+# 원점 주변과 바깥쪽 성능 분리
+for threshold in [25, 50, 100, 200]:
+    sub = diagnostics[
+        diagnostics["line_delta_fF"].abs() >= threshold
+    ]
+    if len(sub):
+        print(
+            f"|Predicted delta| >= {threshold} fF:",
+            f"N={len(sub)}",
+            f"RMSE={np.sqrt(np.mean(sub.residual_fF**2)):.2f} fF"
+        )
