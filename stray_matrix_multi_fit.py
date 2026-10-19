@@ -1,27 +1,43 @@
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
 
 # ============================================================
-# PIN SERIES IMPEDANCE VALIDATION
+# MULTI-PIN DATA -> NEW PIN IMPEDANCE FIT
 #
-# 필요 변수:
-#   df: 기존 Multi-Pin 데이터
-#   results["z_pin"]: Pair Matrix에서 추정한 44개 z_i [Ohm]
-#
-# df["C"], df["C_local_pred"]: Farad
-# 측정 주파수: 10 kHz
+# 기존 results["z_pin"] 사용하지 않음
+# C와 C_local_pred 단위: F
+# 이번 버전은 C 성분만 피팅
 # ============================================================
 
 FREQ = 10000.0
 OMEGA = 2 * np.pi * FREQ
+N = 44
 
-z_pin = np.asarray(
-    results["z_pin"], dtype=complex
+SMU = np.array(
+    [0]*6 + [1]*8 + [2]*8 +
+    [3]*8 + [4]*8 + [5]*6
 )
 
-data = df.copy()
+# 기준 어드미턴스 크기
+# |z| = 30 MOhm에 해당하는 값
+A0 = 1.0 / (30e6)
+
+TRAIN_RATIO = 0.7
+RANDOM_SEED = 42
+
+# v_i = log(a_i / a0)에 대한 정규화
+# 기존 z_i에 맞추는 정규화가 아님
+REG_FF = 20.0
+REG_SIGMA = 0.30
+
+# ============================================================
+# 1. DATA PREPARATION
+# ============================================================
+
+data = df.copy().reset_index(drop=True)
 
 required = [
     "high_pins",
@@ -31,207 +47,358 @@ required = [
     "C_local_pred"
 ]
 
-for col in required:
-    if col not in data.columns:
-        raise ValueError(f"Missing column: {col}")
+for name in required:
+    if name not in data.columns:
+        raise ValueError(f"Missing column: {name}")
 
-if len(z_pin) != 44:
-    raise ValueError("z_pin must have 44 elements.")
+data["C"] = pd.to_numeric(data["C"])
+data["C_local_pred"] = pd.to_numeric(
+    data["C_local_pred"]
+)
 
-# ------------------------------------------------------------
-# 1. Pin별 선로 임피던스 합성
-# ------------------------------------------------------------
+if data["C"].abs().max() > 1e-9:
+    raise ValueError("C must be in Farads.")
 
-def aggregate_line_admittance(high, low):
-    h = np.array(high, dtype=int) - 1
-    l = np.array(low, dtype=int) - 1
+if data["C_local_pred"].abs().max() > 1e-9:
+    raise ValueError("C_local_pred must be in Farads.")
 
-    if len(h) == 0 or len(l) == 0:
-        return np.nan + 1j * np.nan
-
-    zh = z_pin[h]
-    zl = z_pin[l]
-
-    YH = np.sum(1.0 / zh)
-    YL = np.sum(1.0 / zl)
-
-    if abs(YH) < 1e-30 or abs(YL) < 1e-30:
-        return np.nan + 1j * np.nan
-
-    ZH = 1.0 / YH
-    ZL = 1.0 / YL
-
-    if abs(ZH + ZL) < 1e-30:
-        return np.nan + 1j * np.nan
-
-    return 1.0 / (ZH + ZL)
-
-
-y_line = np.array([
-    aggregate_line_admittance(h, l)
-    for h, l in zip(
-        data["high_pins"],
-        data["low_pins"]
-    )
-])
-
-# ------------------------------------------------------------
-# 2. 어드미턴스 -> 등가 정전용량
-# ------------------------------------------------------------
-
-data["C_line"] = y_line.imag / OMEGA
-
-data["C_local_corrected"] = (
+# Local 기생 제거
+data["C_target"] = (
     data["C"] - data["C_local_pred"]
 )
 
-data["C_hybrid_corrected"] = (
-    data["C"]
-    - data["C_local_pred"]
-    - data["C_line"]
-)
+# High/Low 연결 행렬
+H = np.zeros((len(data), N))
+L = np.zeros((len(data), N))
 
-# ------------------------------------------------------------
-# 3. 동일 SMU 점유 구성 내에서 중심화
+for k, row in data.iterrows():
+    high = [int(x) for x in row["high_pins"]]
+    low = [int(x) for x in row["low_pins"]]
+
+    if not high or not low:
+        raise ValueError(f"Empty H/L in row {k}")
+
+    if set(high) & set(low):
+        raise ValueError(f"H/L overlap in row {k}")
+
+    if any(p < 1 or p > 44 for p in high + low):
+        raise ValueError(f"Invalid pin in row {k}")
+
+    H[k, np.array(high)-1] = 1
+    L[k, np.array(low)-1] = 1
+
+# signature를 문자열로 바꿔 그룹화
+data["group_id"] = pd.factorize(
+    data["signature"].astype(str)
+)[0]
+
+# ============================================================
+# 2. TRAIN / TEST SPLIT
 #
-# SMU 기본 성분이 같은 그룹 내에서는
-# 차분 시 소거된다는 가정을 검증한다.
-# ------------------------------------------------------------
+# 같은 signature 내부에서 분리.
+# Singleton 그룹은 피팅에서 제외.
+# ============================================================
 
-size = data.groupby("signature")["C"].transform("size")
-valid = data[(size >= 2)].copy()
+rng = np.random.default_rng(RANDOM_SEED)
 
-columns = {
-    "Raw": "C",
-    "Local only": "C_local_corrected",
-    "Local + Line": "C_hybrid_corrected"
-}
+train = []
+test = []
 
-print("=" * 65)
-print("WITHIN-SIGNATURE MODEL COMPARISON")
-print("=" * 65)
+for _, group in data.groupby("group_id"):
+    idx = group.index.to_numpy()
 
-print("Number of experiments:", len(valid))
-print("Number of signatures:",
-      valid["signature"].nunique())
-
-residuals = {}
-
-for name, col in columns.items():
-    centered = (
-        valid[col]
-        - valid.groupby("signature")[col].transform("mean")
-    )
-
-    r = centered.to_numpy() * 1e15  # F -> fF
-
-    residuals[name] = r
-
-    mae = np.mean(np.abs(r))
-    rmse = np.sqrt(np.mean(r**2))
-    maxae = np.max(np.abs(r))
-
-    print(
-        f"{name:<18}"
-        f"MAE={mae:9.3f} fF  "
-        f"RMSE={rmse:9.3f} fF  "
-        f"MaxAE={maxae:9.3f} fF"
-    )
-
-# ------------------------------------------------------------
-# 4. 특히 Local 변화가 작은 실험에서 검증
-#
-# 동일 signature 내에서 C_local의 평균 대비
-# 차이가 0.1 pF 미만인 측정만 선별.
-# ------------------------------------------------------------
-
-local_center = (
-    valid["C_local_pred"]
-    - valid.groupby("signature")["C_local_pred"].transform("mean")
-)
-
-low_local_mask = (
-    np.abs(local_center.to_numpy()) < 0.1e-12
-)
-
-print("\n" + "=" * 65)
-print("LOW-LOCAL-VARIATION REGION")
-print("=" * 65)
-
-print("Number of points:", np.sum(low_local_mask))
-
-for name, r in residuals.items():
-    rr = r[low_local_mask]
-
-    if len(rr) == 0:
+    if len(idx) < 2:
         continue
 
-    print(
-        f"{name:<18}"
-        f"RMSE={np.sqrt(np.mean(rr**2)):9.3f} fF"
+    idx = rng.permutation(idx)
+
+    n_train = int(
+        np.ceil(len(idx) * TRAIN_RATIO)
+    )
+    n_train = min(n_train, len(idx)-1)
+
+    train.extend(idx[:n_train])
+    test.extend(idx[n_train:])
+
+train = np.array(train, dtype=int)
+test = np.array(test, dtype=int)
+
+if len(train) == 0 or len(test) == 0:
+    raise ValueError("Not enough repeated signatures.")
+
+print("Train rows:", len(train))
+print("Test rows :", len(test))
+
+# ============================================================
+# 3. PIN PARAMETERIZATION
+#
+# a_i = j * A0 * exp(v_i)
+#
+# 각 SMU 안에서 sum(v_i) = 0.
+# 자유 파라미터: 44 - 6 = 38개
+# ============================================================
+
+groups = [
+    np.where(SMU == g)[0]
+    for g in range(6)
+]
+
+def decode_params(x):
+    v = np.zeros(N)
+
+    pos = 0
+
+    for pins in groups:
+        m = len(pins)-1
+
+        v[pins[:-1]] = x[pos:pos+m]
+        v[pins[-1]] = -np.sum(
+            x[pos:pos+m]
+        )
+
+        pos += m
+
+    return v
+
+NUM_PARAMS = N - 6
+
+# ============================================================
+# 4. LINE AGGREGATION
+# ============================================================
+
+def predict_c_line(x):
+    v = decode_params(x)
+
+    # Capacitive pin admittance
+    a = 1j * A0 * np.exp(v)
+
+    ah = H @ a
+    al = L @ a
+
+    y_line = ah * al / (ah + al)
+
+    return y_line.imag / OMEGA
+
+
+# ============================================================
+# 5. GROUP CENTERING
+#
+# 동일 signature 내 평균을 제거하면
+# 미지의 SMU 기준 C가 사라진다는 가정.
+# ============================================================
+
+target_fF = data["C_target"].to_numpy() * 1e15
+group_ids = data["group_id"].to_numpy()
+
+def center_train(values):
+    out = np.zeros(len(train))
+
+    for g in np.unique(group_ids[train]):
+        mask = group_ids[train] == g
+
+        sub = values[train][mask]
+        out[mask] = sub - np.mean(sub)
+
+    return out
+
+
+target_centered = center_train(target_fF)
+
+# ============================================================
+# 6. FIT PIN IMPEDANCE
+# ============================================================
+
+def residual(x):
+    pred_fF = predict_c_line(x) * 1e15
+
+    model_centered = center_train(pred_fF)
+
+    fit_error = (
+        model_centered - target_centered
     )
 
-# ------------------------------------------------------------
-# 5. Pin Line 성분이 실제 Local 제거 후
-#    잔차를 설명하는지 Scatter Plot
-# ------------------------------------------------------------
+    # 정규화: 과도한 Pin 편차 억제
+    v = decode_params(x)
+    reg = REG_FF * v / REG_SIGMA
 
-target = (
-    valid["C_local_corrected"]
-    - valid.groupby("signature")[
-        "C_local_corrected"
-    ].transform("mean")
-) * 1e12
+    return np.r_[fit_error, reg]
 
-line_pred = (
-    valid["C_line"]
-    - valid.groupby("signature")[
-        "C_line"
-    ].transform("mean")
-) * 1e12
 
-x = line_pred.to_numpy()
-y = target.to_numpy()
+x0 = np.zeros(NUM_PARAMS)
 
-mask = np.isfinite(x) & np.isfinite(y)
-x = x[mask]
-y = y[mask]
-
-plt.figure(figsize=(6, 6))
-plt.scatter(x, y, alpha=0.6)
-
-lo = min(x.min(), y.min(), 0)
-hi = max(x.max(), y.max(), 0)
-
-plt.plot(
-    [lo, hi], [lo, hi],
-    "--", label="Ideal y=x"
+result = least_squares(
+    residual,
+    x0,
+    max_nfev=3000,
+    ftol=1e-10,
+    xtol=1e-10,
+    gtol=1e-10
 )
 
-plt.xlabel("Predicted line delta C (pF)")
-plt.ylabel("Observed residual delta C (pF)")
-plt.title("Pin Series Impedance Validation")
-plt.legend()
+print("\nOptimization success:", result.success)
+print("Message:", result.message)
+
+# 새롭게 얻은 z_i
+v_fit = decode_params(result.x)
+
+a_pin_new = (
+    1j * A0 * np.exp(v_fit)
+)
+
+z_pin_new = 1.0 / a_pin_new
+
+# ============================================================
+# 7. TRAIN 그룹 평균으로 TEST 예측
+#
+# Baseline:
+#   C_target = signature 평균
+#
+# New:
+#   C_target = signature 평균 잔차 + C_line
+# ============================================================
+
+line_fF = (
+    predict_c_line(result.x) * 1e15
+)
+
+def evaluate(indices):
+    baseline_errors = []
+    hybrid_errors = []
+
+    for k in indices:
+        g = group_ids[k]
+
+        reference = train[
+            group_ids[train] == g
+        ]
+
+        if len(reference) == 0:
+            continue
+
+        # 기존: 그룹 평균만 사용
+        baseline = np.mean(
+            target_fF[reference]
+        )
+
+        # 신규: 그룹 평균 잔차 + 새 선로 기여
+        offset = np.mean(
+            target_fF[reference]
+            - line_fF[reference]
+        )
+
+        hybrid = offset + line_fF[k]
+
+        baseline_errors.append(
+            target_fF[k] - baseline
+        )
+
+        hybrid_errors.append(
+            target_fF[k] - hybrid
+        )
+
+    return (
+        np.asarray(baseline_errors),
+        np.asarray(hybrid_errors)
+    )
+
+
+def report(title, indices):
+    e_base, e_hybrid = evaluate(indices)
+
+    def calc(e):
+        return (
+            np.mean(np.abs(e)),
+            np.sqrt(np.mean(e**2)),
+            np.max(np.abs(e))
+        )
+
+    b = calc(e_base)
+    h = calc(e_hybrid)
+
+    print("\n" + title)
+    print("-" * 55)
+    print("                 MAE(fF)    RMSE(fF)   MaxAE(fF)")
+    print(
+        f"Baseline       {b[0]:10.3f}"
+        f" {b[1]:11.3f} {b[2]:11.3f}"
+    )
+    print(
+        f"Local + Line   {h[0]:10.3f}"
+        f" {h[1]:11.3f} {h[2]:11.3f}"
+    )
+
+
+report("TRAIN", train)
+report("TEST", test)
+
+# ============================================================
+# 8. TEST SCATTER
+# ============================================================
+
+x_plot = []
+y_plot = []
+
+for k in test:
+    g = group_ids[k]
+
+    reference = train[
+        group_ids[train] == g
+    ]
+
+    base_mean = np.mean(
+        target_fF[reference]
+    )
+
+    line_mean = np.mean(
+        line_fF[reference]
+    )
+
+    x_plot.append(
+        line_fF[k] - line_mean
+    )
+
+    y_plot.append(
+        target_fF[k] - base_mean
+    )
+
+x_plot = np.array(x_plot)
+y_plot = np.array(y_plot)
+
+plt.figure(figsize=(6, 6))
+plt.scatter(x_plot, y_plot, alpha=0.7)
+
+lo = min(x_plot.min(), y_plot.min(), 0)
+hi = max(x_plot.max(), y_plot.max(), 0)
+
+plt.plot([lo, hi], [lo, hi], "--")
+plt.xlabel("Predicted line delta C (fF)")
+plt.ylabel("Measured residual delta C (fF)")
+plt.title("New Pin Impedance - TEST")
 plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-if len(x) > 1 and np.std(x) > 0:
-    slope, intercept = np.polyfit(x, y, 1)
-    corr = (
-        np.corrcoef(x, y)[0, 1]
-        if np.std(y) > 0 else np.nan
+# ============================================================
+# 9. PARAMETER SUMMARY
+# ============================================================
+
+print("\nNEW PIN PARAMETERS")
+print("Pin  SMU       |z_i| (MOhm)")
+
+for p in range(N):
+    print(
+        f"{p+1:2d}   "
+        f"{SMU[p]+1}       "
+        f"{abs(z_pin_new[p])/1e6:10.4f}"
     )
 
-    print("\nLine prediction slope:", slope)
-    print("Line prediction intercept (pF):", intercept)
-    print("Line prediction correlation:", corr)
-
-# ------------------------------------------------------------
-# 6. 다음 분석을 위해 저장
-# ------------------------------------------------------------
-
-data.to_csv(
-    "multipin_hybrid_validation.csv",
-    index=False
-)
+# 후속 분석을 위해 변수 유지
+pin_fit_new = {
+    "z_pin": z_pin_new,
+    "a_pin": a_pin_new,
+    "v_pin": v_fit,
+    "train": train,
+    "test": test,
+    "optimization": result,
+    "line_fF": line_fF
+}
