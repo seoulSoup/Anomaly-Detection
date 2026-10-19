@@ -458,3 +458,59 @@ for threshold in [25, 50, 100, 200]:
             f"N={len(sub)}",
             f"RMSE={np.sqrt(np.mean(sub.residual_fF**2)):.2f} fF"
         )
+
+/////////<__/_<=<=_=>=>
+
+
+import numpy as np
+import pandas as pd
+
+# diagnostics:
+# 기존 코드의 Test 결과 테이블
+# columns:
+# High, Low, residual_fF, abs_error_fF
+
+rows = []
+
+for pin in range(1, 45):
+    for side in ["High", "Low"]:
+
+        used = diagnostics[side].apply(
+            lambda pins: pin in pins
+        )
+
+        sub = diagnostics.loc[used]
+
+        if len(sub) < 3:
+            continue
+
+        r = sub["residual_fF"].to_numpy()
+
+        rows.append({
+            "Pin": pin,
+            "SMU": int(SMU[pin-1]) + 1,
+            "Side": side,
+            "Count": len(sub),
+            "Bias_fF": np.mean(r),
+            "MAE_fF": np.mean(np.abs(r)),
+            "RMSE_fF": np.sqrt(np.mean(r**2))
+        })
+
+pin_errors = pd.DataFrame(rows)
+
+print("\n=== PIN ERROR RANKING ===")
+print(
+    pin_errors.sort_values(
+        "RMSE_fF", ascending=False
+    ).head(20).to_string(index=False)
+)
+
+print("\n=== SMU2 ONLY ===")
+print(
+    pin_errors[
+        pin_errors["SMU"] == 2
+    ].sort_values(
+        ["Side", "RMSE_fF"],
+        ascending=[True, False]
+    ).to_string(index=False)
+)
