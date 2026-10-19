@@ -200,3 +200,37 @@ data.to_csv(
 summary.to_csv(
     "smu_occupancy_group_summary.csv"
 )
+
+
+
+import numpy as np
+
+print("=== TOP 10 HIGH RESIDUAL SIGNATURES ===")
+
+print(
+    summary.sort_values(
+        "base_std_fF", ascending=False
+    )[[
+        "count",
+        "base_std_fF",
+        "base_range_fF",
+        "base_mean_pF"
+    ]].head(10).to_string()
+)
+
+print("\n=== CORRECTED RESIDUAL QUANTILES (fF) ===")
+
+print(
+    np.abs(data.loc[
+        data["group_size"] >= 2,
+        "base_residual_fF"
+    ]).quantile([0.5, 0.75, 0.90, 0.95, 0.99])
+)
+
+print("\n=== GROUP STD DISTRIBUTION (fF) ===")
+
+print(
+    summary["base_std_fF"].quantile(
+        [0.25, 0.50, 0.75, 0.90, 0.95, 1.00]
+    )
+)
