@@ -324,3 +324,93 @@ pin_results.to_csv(
 )
 
 print("\nSaved result CSV files.")
+
+
+
+
+
+
+
+import numpy as np
+
+# ==========================================================
+# Independent Capacitance Prediction
+#
+# Required fitted parameters:
+#   c_pin   : array of 44 effective pin C values [pF]
+#   cross_pf: fitted cross-SMU pair coefficient [pF]
+#
+# Input:
+#   high: iterable of pin numbers (1~44)
+#   low : iterable of pin numbers (1~44)
+#
+# Output:
+#   Predicted capacitance [pF]
+# ==========================================================
+
+def predict_cap(high, low):
+    high = tuple(int(p) for p in high)
+    low = tuple(int(p) for p in low)
+
+    if not high or not low:
+        raise ValueError("High/Low cannot be empty")
+
+    if len(set(high)) != len(high):
+        raise ValueError("Duplicate High pins")
+
+    if len(set(low)) != len(low):
+        raise ValueError("Duplicate Low pins")
+
+    if set(high) & set(low):
+        raise ValueError("High and Low overlap")
+
+    if any(p < 1 or p > 44 for p in high + low):
+        raise ValueError("Pin must be between 1 and 44")
+
+    # 1. Parallel aggregation on each side,
+    #    followed by series combination.
+    ch = sum(c_pin[p - 1] for p in high)
+    cl = sum(c_pin[p - 1] for p in low)
+
+    c_line = ch * cl / (ch + cl)
+
+    # 2. Pair Sum correction.
+    ne = no = n2 = ncross = 0
+
+    for h in high:
+        for l in low:
+            if PIN_SMU[h] != PIN_SMU[l]:
+                ncross += 1
+                continue
+
+            d = abs(h - l)
+
+            if d == 1:
+                if max(h, l) % 2 == 0:
+                    ne += 1
+                else:
+                    no += 1
+            elif d == 2:
+                n2 += 1
+
+    c_pair = (
+        1.544 * ne
+        + 0.605 * no
+        + 0.175 * n2
+        + cross_pf * ncross
+    )
+
+    return float(c_line + c_pair)
+
+
+# ==========================================================
+# Example
+# ==========================================================
+
+high = list(range(15, 45))
+low = list(range(7, 14))
+
+c_pred_pf = predict_cap(high, low)
+
+print(f"Predicted C = {c_pred_pf:.6f} pF")
+
