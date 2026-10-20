@@ -1,467 +1,366 @@
 
-import ast
-import re
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
 from sklearn.model_selection import GroupShuffleSplit
 import joblib
 
-# ============================================================
-# 0. SETTINGS
-# ============================================================
+# ==========================================================
+# 0. REQUIREMENTS FROM PREVIOUS CODE
+#
+# df, X, pair_c, IMP_MODES, PAIR_MODES
+#
+# X fields:
+#   H, L, counts, h_seen, l_seen, config, signature
+#
+# pair_c(X, idx, cross_pf, pair_mode)
+# returns empirical pair capacitance in pF.
+# ==========================================================
 
 FREQ = 10000.0
 OMEGA = 2 * np.pi * FREQ
 
-IMP_MODES = ["Parallel", "Mean", "SharedPath"]
-PAIR_MODES = ["Sum", "MaxPerPin", "Sqrt", "PartialSum"]
+# Conversion: pF -> susceptance in nS
+B_PER_PF = OMEGA * 1e-3
+
+# IMPORTANT: set the actual unit of df["G"]
+G_UNIT = "S"   # "S", "uS", or "nS"
+G_TO_NS = {"S": 1e9, "uS": 1e3, "nS": 1.0}
 
 N_FOLDS = 2
 TEST_SIZE = 0.25
 SEED = 42
 
-# Fixed zone coefficients, pF
-# Adjacent even / adjacent odd / distance 2
-LOCAL = np.array([1.544, 0.605, 0.175])
+# Loss scales. Adjust after inspecting data noise.
+C_SCALE_PF = 0.5
+G_SCALE_NS = 1.0
 
-# Cross-SMU pair coefficient to be fitted
-CROSS_RANGE = (0.0, 2.0)
+# Individual-pin regularization:
+# effective RMS tolerances for pin differences.
+PIN_G_SIGMA_NS = 1.0
+PIN_B_SIGMA_NS = 20.0
+PIN_REG_WEIGHT = 1.0
 
-# Common effective pin capacitance, pF
-C_RANGE = (0.001, 100.0)
+# Optional regularization for common parameters.
+# Larger sigma => weaker prior.
+COMMON_G_SIGMA_NS = 10.0
+COMMON_B_SIGMA_NS = 100.0
 
-# Shared-path effective capacitance, pF
-SHARED_RANGE = (0.01, 1000.0)
+IMP_MODES = ["Parallel", "Mean", "SharedPath"]
+PAIR_MODES = ["Sum", "MaxPerPin", "Sqrt", "PartialSum"]
 
-# Stage 2 relative pin deviation regularization
-PIN_SIGMA = 0.25
-PIN_REG = 0.30
+# ----------------------------------------------------------
+# Use original df to construct measured complex admittance.
+# ----------------------------------------------------------
 
-SMUS = [
-    range(1, 7),
-    range(7, 15),
-    range(15, 23),
-    range(23, 31),
-    range(31, 39),
-    range(39, 45)
-]
-
-PIN_SMU = {
-    p: g for g, grp in enumerate(SMUS) for p in grp
-}
-
-# ============================================================
-# 1. PARSING
-# ============================================================
-
-def parse_pins(v):
-    if isinstance(v, (tuple, list, np.ndarray)):
-        pins = [int(x) for x in v]
-    elif isinstance(v, str):
-        try:
-            obj = ast.literal_eval(v)
-            pins = list(obj) if isinstance(
-                obj, (list, tuple, set)
-            ) else re.findall(r"\d+", v)
-            pins = [int(x) for x in pins]
-        except (ValueError, SyntaxError):
-            pins = [int(x) for x in re.findall(r"\d+", v)]
-    else:
-        raise ValueError(f"Unsupported pins: {v}")
-
-    if not pins or len(pins) != len(set(pins)):
-        raise ValueError(f"Empty or duplicate pins: {v}")
-    if not all(1 <= p <= 44 for p in pins):
-        raise ValueError(f"Pin out of range: {v}")
-    return tuple(sorted(pins))
-
-
-# ============================================================
-# 2. FOUR ZONES
-#
-# 0: Same SMU, adjacent, larger pin even
-# 1: Same SMU, adjacent, larger pin odd
-# 2: Same SMU, distance 2
-# 3: Different SMU
-#
-# Same SMU, distance >= 3 has zero pair increment.
-# ============================================================
-
-ZONE = np.zeros((4, 44, 44), dtype=float)
-
-for a in range(1, 45):
-    for b in range(1, 45):
-        if a == b:
-            continue
-
-        if PIN_SMU[a] != PIN_SMU[b]:
-            k = 3
-        elif abs(a - b) == 1:
-            k = 0 if max(a, b) % 2 == 0 else 1
-        elif abs(a - b) == 2:
-            k = 2
-        else:
-            continue
-
-        ZONE[k, a-1, b-1] = 1.0
-
-
-# ============================================================
-# 3. CONSTRUCT FEATURES
-#
-# Usable for training and arbitrary independent predictions.
-# ============================================================
-
-def build_features(high_list, low_list):
-    n = len(high_list)
-
-    h = np.zeros((n, 44))
-    l = np.zeros((n, 44))
-    configurations = []
-    signatures = []
-
-    for k, (hv, lv) in enumerate(zip(high_list, low_list)):
-        hp = parse_pins(hv)
-        lp = parse_pins(lv)
-
-        if set(hp) & set(lp):
-            raise ValueError(f"Overlapping H/L: row {k}")
-
-        h[k, np.asarray(hp)-1] = 1
-        l[k, np.asarray(lp)-1] = 1
-
-        hc = [
-            sum(p in hp for p in group)
-            for group in SMUS
-        ]
-        lc = [
-            sum(p in lp for p in group)
-            for group in SMUS
-        ]
-
-        configurations.append(str((hp, lp)))
-        signatures.append(str(tuple(hc + lc)))
-
-    # Per-pin presence of each crossing pair category.
-    # Shape: [measurements, 44 pins, 4 zones]
-    h_seen = np.stack([
-        (h > 0) & ((l @ ZONE[z].T) > 0)
-        for z in range(4)
-    ], axis=2)
-
-    l_seen = np.stack([
-        (l > 0) & ((h @ ZONE[z]) > 0)
-        for z in range(4)
-    ], axis=2)
-
-    # Total number of crossing pairs in each category.
-    counts = np.stack([
-        np.sum(h * (l @ ZONE[z].T), axis=1)
-        for z in range(4)
-    ], axis=1)
-
-    return {
-        "H": h,
-        "L": l,
-        "h_seen": h_seen,
-        "l_seen": l_seen,
-        "counts": counts,
-        "config": np.array(configurations),
-        "signature": np.array(signatures)
-    }
-
-
-data = df.copy().reset_index(drop=True)
-
-for col in ["high_pins", "low_pins", "C"]:
-    if col not in data:
-        raise ValueError(f"Missing {col}")
-
-X = build_features(
-    data["high_pins"],
-    data["low_pins"]
-)
-
-# Measurements: F -> pF
-Y = pd.to_numeric(
-    data["C"]
+C_TRUE_PF = pd.to_numeric(
+    df["C"]
 ).to_numpy(dtype=float) * 1e12
 
-if not np.isfinite(Y).all():
-    raise ValueError("Invalid capacitance data")
+G_TRUE_NS = pd.to_numeric(
+    df["G"]
+).to_numpy(dtype=float) * G_TO_NS[G_UNIT]
 
-print("Measurements:", len(Y))
-print("Unique configs:", len(set(X["config"])))
-print("Unique signatures:", len(set(X["signature"])))
-print("Zone pair counts:", X["counts"].sum(axis=0))
+if len(C_TRUE_PF) != len(X["H"]):
+    raise ValueError("df and X have different row counts")
 
+if not (
+    np.isfinite(C_TRUE_PF).all()
+    and np.isfinite(G_TRUE_NS).all()
+):
+    raise ValueError("Non-finite C/G values")
 
-# ============================================================
-# 4. PIN IMPEDANCE AGGREGATION
+Y_TRUE_NS = (
+    G_TRUE_NS + 1j * B_PER_PF * C_TRUE_PF
+)
+
+print("C range [pF]:", C_TRUE_PF.min(), C_TRUE_PF.max())
+print("G range [nS]:", G_TRUE_NS.min(), G_TRUE_NS.max())
+
+# ==========================================================
+# 1. COMPLEX ADMITTANCE AGGREGATION
 #
-# Pin i:
-#    y_i = j*omega*c_i
+# Complex pin admittance in nS.
 #
-# For pure capacitive fitting, each mode is
-# expressed directly as an effective capacitance.
-#
-# Parallel: sum(c_i)
-# Mean:     mean(c_i)
-# Shared:   sum(c_i)*Cs/(sum(c_i)+Cs)
-#
-# After H and L aggregation:
-# Cimp = Ch*Cl/(Ch+Cl)
-# ============================================================
+# SharedPath:
+#  Z_shared is in MOhm
+#  Y is in nS
+#  Z(MOhm)*Y(nS) = 1e-3 dimensionless
+# ==========================================================
 
-def aggregate_side(mask, c_pin, imp_mode, cs):
-    s = mask @ c_pin
+def aggregate_complex(mask, y_pin, mode, z_shared=None):
+    total = mask @ y_pin
 
-    if imp_mode == "Parallel":
-        return s
+    if mode == "Parallel":
+        return total
 
-    if imp_mode == "Mean":
-        n = mask.sum(axis=1)
+    if mode == "Mean":
+        count = mask.sum(axis=1)
         return np.divide(
-            s, n,
-            out=np.zeros_like(s),
-            where=n > 0
+            total, count,
+            out=np.zeros_like(total),
+            where=count > 0
         )
 
-    if imp_mode == "SharedPath":
-        return s * cs / (s + cs)
+    if mode == "SharedPath":
+        denominator = (
+            1.0 + 1e-3*z_shared*total
+        )
+        return total / denominator
 
-    raise ValueError(imp_mode)
+    raise ValueError(mode)
 
 
-def impedance_c(features, idx, c_pin, imp_mode, cs):
-    ch = aggregate_side(
-        features["H"][idx], c_pin, imp_mode, cs
+def line_admittance(idx, y_pin, mode, z_shared=None):
+    yh = aggregate_complex(
+        X["H"][idx], y_pin, mode, z_shared
     )
-    cl = aggregate_side(
-        features["L"][idx], c_pin, imp_mode, cs
-    )
-
-    return np.divide(
-        ch * cl, ch + cl,
-        out=np.zeros_like(ch),
-        where=(ch + cl) > 0
+    yl = aggregate_complex(
+        X["L"][idx], y_pin, mode, z_shared
     )
 
+    denominator = yh + yl
 
-# ============================================================
-# 5. PAIR INCREMENT AGGREGATION
-#
-# Four candidate functions.
-#
-# Sum:
-#   Sum all crossing pair contributions.
-#
-# MaxPerPin:
-#   Maximum coefficient seen by each selected H pin,
-#   plus maximum for each selected L pin,
-#   averaged to retain H/L symmetry.
-#
-# Sqrt:
-#   Geometric mean of Sum and MaxPerPin.
-#
-# PartialSum:
-#   MaxPerPin + 0.25*(Sum-MaxPerPin).
-# ============================================================
+    out = np.zeros_like(yh, dtype=complex)
+    valid = np.abs(denominator) > 1e-12
 
-def pair_c(features, idx, cross_pf, pair_mode):
-    coef = np.r_[LOCAL, cross_pf]
-
-    s = features["counts"][idx] @ coef
-
-    hs = np.where(
-        features["h_seen"][idx],
-        coef[None, None, :],
-        0.0
-    )
-    ls = np.where(
-        features["l_seen"][idx],
-        coef[None, None, :],
-        0.0
+    out[valid] = (
+        yh[valid]*yl[valid]/denominator[valid]
     )
 
-    m = 0.5 * (
-        hs.max(axis=2).sum(axis=1)
-        + ls.max(axis=2).sum(axis=1)
+    return out
+
+
+def predict_complex(
+    idx, y_pin, cross_pf, imp_mode,
+    pair_mode, z_shared=None
+):
+    y_line = line_admittance(
+        idx, y_pin, imp_mode, z_shared
     )
 
-    if pair_mode == "Sum":
-        return s
-    if pair_mode == "MaxPerPin":
-        return m
-    if pair_mode == "Sqrt":
-        return np.sqrt(np.maximum(s*m, 0))
-    if pair_mode == "PartialSum":
-        return m + 0.25*(s-m)
-
-    raise ValueError(pair_mode)
-
-
-# ============================================================
-# 6. STAGE 1: COMMON PIN IMPEDANCE
-#
-# Fitted parameters:
-#   c_common
-#   cross_pair_coefficient
-#   c_shared (only for SharedPath)
-#
-# All individual pin coefficients are identical.
-# ============================================================
-
-def decode_common(t, imp_mode):
-    common_c = np.exp(t[0])
-    cross_pf = t[1]
-    shared = (
-        np.exp(t[2]) if imp_mode == "SharedPath"
-        else None
+    c_pair = pair_c(
+        X, idx, cross_pf, pair_mode
     )
-    return common_c, cross_pf, shared
+
+    return y_line + 1j*B_PER_PF*c_pair
 
 
-def predict_common(features, idx, t, imp_mode, pair_mode):
-    common_c, cross_pf, shared = decode_common(
+# ==========================================================
+# 2. DATA ERROR IN C AND G
+# ==========================================================
+
+def data_residual(pred, idx):
+    pred_g = pred.real
+    pred_c = pred.imag / B_PER_PF
+
+    return np.r_[
+        (pred_c - C_TRUE_PF[idx]) / C_SCALE_PF,
+        (pred_g - G_TRUE_NS[idx]) / G_SCALE_NS
+    ]
+
+
+# ==========================================================
+# 3. STAGE 1: COMMON COMPLEX PIN ADMITTANCE
+#
+# Parameters:
+#  g0, b0   [nS]
+#  cross_pf [pF]
+#  SharedPath only: zs_re, zs_im [MOhm]
+#
+# Both real and imaginary parts are fitted.
+# ==========================================================
+
+def decode_common(t, mode):
+    g0, b0, cross_pf = t[:3]
+
+    z_shared = None
+    if mode == "SharedPath":
+        z_shared = complex(t[3], t[4])
+
+    return complex(g0, b0), cross_pf, z_shared
+
+
+def predict_common(idx, t, imp_mode, pair_mode):
+    y0, cross_pf, z_shared = decode_common(
         t, imp_mode
     )
 
-    c_pin = np.full(44, common_c)
+    y_pin = np.full(44, y0, dtype=complex)
 
-    return (
-        impedance_c(features, idx, c_pin, imp_mode, shared)
-        + pair_c(features, idx, cross_pf, pair_mode)
+    return predict_complex(
+        idx, y_pin, cross_pf,
+        imp_mode, pair_mode, z_shared
     )
 
 
 def fit_common(train, imp_mode, pair_mode):
-    init = [np.log(0.6), 0.01]
-    lb = [np.log(C_RANGE[0]), CROSS_RANGE[0]]
-    ub = [np.log(C_RANGE[1]), CROSS_RANGE[1]]
+    # Pin susceptance initial value: equivalent 0.5 pF.
+    initial = [
+        0.1, 0.5*B_PER_PF, 0.01
+    ]
+
+    lower = [-1000.0, -1000.0, 0.0]
+    upper = [1000.0, 1000.0, 2.0]
 
     if imp_mode == "SharedPath":
-        init.append(np.log(10.0))
-        lb.append(np.log(SHARED_RANGE[0]))
-        ub.append(np.log(SHARED_RANGE[1]))
+        # Complex shared impedance in MOhm
+        initial += [1.0, 0.0]
+        lower += [-1000.0, -1000.0]
+        upper += [1000.0, 1000.0]
 
     def residual(t):
-        return (
-            predict_common(
-                X, train, t, imp_mode, pair_mode
-            ) - Y[train]
+        pred = predict_common(
+            train, t, imp_mode, pair_mode
         )
+
+        # Weak preference for modest common G/B.
+        reg = [
+            t[0] / COMMON_G_SIGMA_NS,
+            t[1] / COMMON_B_SIGMA_NS
+        ]
+
+        if imp_mode == "SharedPath":
+            # Prevent near-singular shared paths.
+            reg.extend([
+                t[3] / 300.0,
+                t[4] / 300.0
+            ])
+
+        return np.r_[
+            data_residual(pred, train),
+            reg
+        ]
 
     result = least_squares(
         residual,
-        init,
-        bounds=(lb, ub),
-        max_nfev=600,
+        initial,
+        bounds=(lower, upper),
+        max_nfev=500,
         x_scale="jac"
     )
+
+    if not result.success:
+        print("Common fit warning:", result.message)
 
     return result.x
 
 
-# ============================================================
-# 7. STAGE 2: INDIVIDUAL PIN IMPEDANCES
+# ==========================================================
+# 4. STAGE 2: INDIVIDUAL COMPLEX PIN ADMITTANCES
 #
-# All Stage 1 parameters remain FIXED.
+# Stage 1 parameters are fixed.
 #
-# c_i = c_common * exp(v_i - mean(v))
+# y_i = y0 + dG_i + j*dB_i
 #
-# Thus only relative pin deviations are fitted.
-# ============================================================
+# We center deviations to preserve common level.
+# ==========================================================
 
-def pin_coefficients(t_common, v, imp_mode):
-    common_c, _, _ = decode_common(
-        t_common, imp_mode
+def decode_individual(t_common, v, mode):
+    y0, cross_pf, z_shared = decode_common(
+        t_common, mode
     )
 
-    centered = v - np.mean(v)
+    dg = v[:44] - np.mean(v[:44])
+    db = v[44:] - np.mean(v[44:])
 
-    return common_c * np.exp(centered)
+    y_pin = y0 + dg + 1j*db
+
+    return y_pin, cross_pf, z_shared
 
 
 def predict_individual(
-    features, idx, t_common, v, imp_mode, pair_mode
+    idx, t_common, v, imp_mode, pair_mode
 ):
-    _, cross_pf, shared = decode_common(
-        t_common, imp_mode
-    )
-
-    c_pin = pin_coefficients(
+    y_pin, cross_pf, z_shared = decode_individual(
         t_common, v, imp_mode
     )
 
-    return (
-        impedance_c(features, idx, c_pin, imp_mode, shared)
-        + pair_c(features, idx, cross_pf, pair_mode)
+    return predict_complex(
+        idx, y_pin, cross_pf,
+        imp_mode, pair_mode, z_shared
     )
 
 
 def fit_individual(train, t_common, imp_mode, pair_mode):
     def residual(v):
         pred = predict_individual(
-            X, train, t_common, v,
+            train, t_common, v,
             imp_mode, pair_mode
         )
 
-        centered = v - np.mean(v)
+        dg = v[:44] - np.mean(v[:44])
+        db = v[44:] - np.mean(v[44:])
 
-        reg = (
-            PIN_REG / PIN_SIGMA
-        ) * centered
+        reg = PIN_REG_WEIGHT * np.r_[
+            dg / PIN_G_SIGMA_NS,
+            db / PIN_B_SIGMA_NS
+        ]
 
         return np.r_[
-            pred - Y[train],
+            data_residual(pred, train),
             reg
         ]
 
     result = least_squares(
         residual,
-        np.zeros(44),
-        bounds=(-2*np.ones(44), 2*np.ones(44)),
-        max_nfev=350,
+        np.zeros(88),
+        bounds=(
+            np.r_[
+                np.full(44, -100.0),
+                np.full(44, -300.0)
+            ],
+            np.r_[
+                np.full(44, 100.0),
+                np.full(44, 300.0)
+            ]
+        ),
+        max_nfev=300,
         x_scale="jac"
     )
 
-    return result.x - np.mean(result.x)
+    if not result.success:
+        print("Individual fit warning:", result.message)
+
+    return result.x
 
 
-# ============================================================
-# 8. METRICS
-# ============================================================
+# ==========================================================
+# 5. METRICS
+# ==========================================================
 
-def metrics(y, p):
-    e = (p-y)*1000  # pF -> fF
+def evaluate(y_pred, idx):
+    pred_c = y_pred.imag / B_PER_PF
+    pred_g = y_pred.real
+
+    ec_ff = (
+        pred_c - C_TRUE_PF[idx]
+    ) * 1000
+
+    eg_ns = pred_g - G_TRUE_NS[idx]
+
     return {
-        "RMSE_fF": float(np.sqrt(np.mean(e**2))),
-        "MAE_fF": float(np.mean(np.abs(e))),
-        "P95_fF": float(np.percentile(np.abs(e), 95)),
-        "Bias_fF": float(np.mean(e))
+        "C_RMSE_fF": np.sqrt(np.mean(ec_ff**2)),
+        "C_MAE_fF": np.mean(np.abs(ec_ff)),
+        "G_RMSE_nS": np.sqrt(np.mean(eg_ns**2)),
+        "G_MAE_nS": np.mean(np.abs(eg_ns)),
+        "Combined": np.sqrt(np.mean(
+            (ec_ff / (1000*C_SCALE_PF))**2
+            + (eg_ns / G_SCALE_NS)**2
+        ))
     }
 
 
-# ============================================================
-# 9. CROSS VALIDATION: ALL 24 VARIANTS
-#
-# 12 aggregation pairs * 2 pin modes.
-#
-# Two validation methods:
-# - RandomConfig: never leak exact configs.
-# - UnseenSignature: new SMU occupancy patterns.
-# ============================================================
+# ==========================================================
+# 6. ALL 12 COMBINATIONS
+# ==========================================================
 
 rows = []
-param_rows = []
 
-for split_name, group in [
+for split_name, groups in [
     ("RandomConfig", X["config"]),
     ("UnseenSignature", X["signature"])
 ]:
-
     cv = GroupShuffleSplit(
         n_splits=N_FOLDS,
         test_size=TEST_SIZE,
@@ -469,22 +368,20 @@ for split_name, group in [
     )
 
     for fold, (train, test) in enumerate(
-        cv.split(X["H"], groups=group), start=1
+        cv.split(X["H"], groups=groups),
+        start=1
     ):
-
         for imp_mode in IMP_MODES:
             for pair_mode in PAIR_MODES:
 
-                # ---- Stage 1 ----
+                # Common complex pin model
                 t = fit_common(
                     train, imp_mode, pair_mode
                 )
 
-                p0 = predict_common(
-                    X, test, t, imp_mode, pair_mode
+                pred0 = predict_common(
+                    test, t, imp_mode, pair_mode
                 )
-
-                m0 = metrics(Y[test], p0)
 
                 rows.append({
                     "Split": split_name,
@@ -492,19 +389,17 @@ for split_name, group in [
                     "Impedance": imp_mode,
                     "Pair": pair_mode,
                     "PinFit": "Common",
-                    **m0
+                    **evaluate(pred0, test)
                 })
 
-                # ---- Stage 2 ----
+                # Individual complex pin model
                 v = fit_individual(
                     train, t, imp_mode, pair_mode
                 )
 
-                p1 = predict_individual(
-                    X, test, t, v, imp_mode, pair_mode
+                pred1 = predict_individual(
+                    test, t, v, imp_mode, pair_mode
                 )
-
-                m1 = metrics(Y[test], p1)
 
                 rows.append({
                     "Split": split_name,
@@ -512,256 +407,121 @@ for split_name, group in [
                     "Impedance": imp_mode,
                     "Pair": pair_mode,
                     "PinFit": "Individual",
-                    **m1
-                })
-
-                common_c, cross_pf, shared = (
-                    decode_common(t, imp_mode)
-                )
-
-                c_pin = pin_coefficients(
-                    t, v, imp_mode
-                )
-
-                param_rows.append({
-                    "Split": split_name,
-                    "Fold": fold,
-                    "Impedance": imp_mode,
-                    "Pair": pair_mode,
-                    "CommonC_pF": common_c,
-                    "CrossC_pF": cross_pf,
-                    "SharedC_pF": shared,
-                    "PinMin_pF": c_pin.min(),
-                    "PinMax_pF": c_pin.max(),
-                    "PinRatio": c_pin.max()/c_pin.min(),
-                    "Pin7_pF": c_pin[6]
+                    **evaluate(pred1, test)
                 })
 
                 print(
-                    f"{split_name:<17} "
-                    f"F{fold} "
-                    f"{imp_mode:<11} "
-                    f"{pair_mode:<11} "
-                    f"Common={m0['RMSE_fF']:7.1f} "
-                    f"Individual={m1['RMSE_fF']:7.1f}"
+                    split_name, fold,
+                    imp_mode, pair_mode,
+                    "C RMSE:",
+                    round(evaluate(pred1, test)["C_RMSE_fF"], 1),
+                    "G RMSE:",
+                    round(evaluate(pred1, test)["G_RMSE_nS"], 3)
                 )
 
 
-# ============================================================
-# 10. RESULTS SUMMARY
-# ============================================================
+# ==========================================================
+# 7. REPORT
+# ==========================================================
 
-score_df = pd.DataFrame(rows)
-param_df = pd.DataFrame(param_rows)
+complex_scores = pd.DataFrame(rows)
 
-summary = (
-    score_df.groupby(
+complex_summary = (
+    complex_scores.groupby(
         ["Split", "Impedance", "Pair", "PinFit"]
     )
     .agg(
-        RMSE_mean=("RMSE_fF", "mean"),
-        RMSE_std=("RMSE_fF", "std"),
-        MAE_mean=("MAE_fF", "mean"),
-        P95_mean=("P95_fF", "mean"),
-        Bias_mean=("Bias_fF", "mean")
+        C_RMSE_mean=("C_RMSE_fF", "mean"),
+        C_RMSE_std=("C_RMSE_fF", "std"),
+        G_RMSE_mean=("G_RMSE_nS", "mean"),
+        G_RMSE_std=("G_RMSE_nS", "std"),
+        Combined_mean=("Combined", "mean")
     )
     .reset_index()
 )
 
-print("\n" + "="*90)
-print("ALL AGGREGATION COMBINATIONS")
-print("="*90)
+print("\n=== COMPLEX ADMITTANCE MODEL COMPARISON ===")
+print(
+    complex_summary.round(3).to_string(index=False)
+)
+
+print("\n=== TOP MODELS: UNSEEN SIGNATURE ===")
+
+ranked = (
+    complex_summary[
+        complex_summary["Split"] == "UnseenSignature"
+    ]
+    .sort_values("Combined_mean")
+)
 
 print(
-    summary.round(2).to_string(index=False)
+    ranked.head(12).round(3).to_string(index=False)
+)
+
+complex_scores.to_csv(
+    "complex_admittance_cv.csv",
+    index=False
+)
+
+complex_summary.to_csv(
+    "complex_admittance_summary.csv",
+    index=False
 )
 
 
-# ============================================================
-# 11. PERFORMANCE PIVOT TABLES
-# ============================================================
+# ==========================================================
+# 8. FINAL MODEL FIT
+# ==========================================================
 
-for split_name in ["RandomConfig", "UnseenSignature"]:
-    for pinfit in ["Common", "Individual"]:
-        sub = summary[
-            (summary["Split"] == split_name)
-            & (summary["PinFit"] == pinfit)
-        ]
-
-        pivot = sub.pivot(
-            index="Impedance",
-            columns="Pair",
-            values="RMSE_mean"
-        )
-
-        print(
-            f"\n{split_name} | {pinfit} | RMSE fF"
-        )
-        print(pivot.round(1).to_string())
-
-
-# ============================================================
-# 12. PIN-FITTING BENEFIT
-# ============================================================
-
-gain_table = summary.pivot_table(
-    index=["Split", "Impedance", "Pair"],
-    columns="PinFit",
-    values="RMSE_mean"
-).reset_index()
-
-gain_table["Gain_fF"] = (
-    gain_table["Common"]
-    - gain_table["Individual"]
-)
-
-print("\n=== PIN FITTING BENEFIT ===")
-print(
-    gain_table.sort_values(
-        ["Split", "Gain_fF"],
-        ascending=[True, False]
-    ).round(2).to_string(index=False)
-)
-
-print("\n=== PARAMETER STABILITY ===")
-print(
-    param_df.groupby(["Split", "Impedance", "Pair"])[
-        ["CommonC_pF", "CrossC_pF", "SharedC_pF",
-         "PinRatio", "Pin7_pF"]
-    ].agg(["mean", "std"]).round(3).to_string()
-)
-
-
-# ============================================================
-# 13. SELECT MODEL
-#
-# Best UnseenSignature mean RMSE.
-# Selection on these folds is exploratory.
-# ============================================================
-
-unseen = summary[
-    summary["Split"] == "UnseenSignature"
-]
-
-best = unseen.sort_values("RMSE_mean").iloc[0]
+best = ranked.iloc[0]
 
 BEST_IMP = best["Impedance"]
 BEST_PAIR = best["Pair"]
 BEST_PINFIT = best["PinFit"]
 
-print("\n=== SELECTED MODEL ===")
-print("Impedance :", BEST_IMP)
-print("Pair      :", BEST_PAIR)
-print("PinFit    :", BEST_PINFIT)
-print("RMSE      :", best["RMSE_mean"], "fF")
+all_idx = np.arange(len(C_TRUE_PF))
 
-
-# ============================================================
-# 14. FINAL FIT ON ALL MEASUREMENTS
-# ============================================================
-
-all_idx = np.arange(len(Y))
-final_common = fit_common(
+final_t = fit_common(
     all_idx, BEST_IMP, BEST_PAIR
 )
 
 final_v = (
     fit_individual(
-        all_idx, final_common,
-        BEST_IMP, BEST_PAIR
+        all_idx, final_t, BEST_IMP, BEST_PAIR
     )
     if BEST_PINFIT == "Individual"
-    else np.zeros(44)
+    else np.zeros(88)
 )
 
-final_c_pin = pin_coefficients(
-    final_common, final_v, BEST_IMP
+y_pin, cross_pf, z_shared = decode_individual(
+    final_t, final_v, BEST_IMP
 )
 
-pin_table = pd.DataFrame({
+# Convert effective pin admittance to impedance.
+# y_pin in nS => impedance in Ohms.
+z_pin_ohm = 1.0 / (y_pin * 1e-9)
+
+pin_report = pd.DataFrame({
     "Pin": np.arange(1, 45),
-    "SMU": [PIN_SMU[p]+1 for p in range(1, 45)],
-    "EffectiveC_pF": final_c_pin,
-    "AbsZ_MOhm": (
-        1/(OMEGA*final_c_pin*1e-12)/1e6
-    )
+    "G_pin_nS": y_pin.real,
+    "B_pin_nS": y_pin.imag,
+    "R_Z_MOhm": z_pin_ohm.real / 1e6,
+    "X_Z_MOhm": z_pin_ohm.imag / 1e6
 })
 
-print("\n=== FINAL PIN PARAMETERS ===")
-print(pin_table.round(4).to_string(index=False))
+print("\n=== SELECTED MODEL ===")
+print(BEST_IMP, BEST_PAIR, BEST_PINFIT)
+print("Cross coefficient [pF]:", cross_pf)
+print("Shared Z [MOhm]:", z_shared)
 
-
-# ============================================================
-# 15. INDEPENDENT ABSOLUTE PREDICTION
-# ============================================================
-
-def predict_new(high, low,
-                impedance=None,
-                pair=None,
-                pinfit=None):
-
-    impedance = impedance or BEST_IMP
-    pair = pair or BEST_PAIR
-    pinfit = pinfit or BEST_PINFIT
-
-    if (impedance, pair) != (BEST_IMP, BEST_PAIR):
-        raise ValueError(
-            "Only selected model was refitted for deployment."
-        )
-
-    features = build_features([high], [low])
-    idx = np.array([0])
-
-    if pinfit == "Individual":
-        c_pred = predict_individual(
-            features, idx, final_common,
-            final_v, impedance, pair
-        )[0]
-    elif pinfit == "Common":
-        c_pred = predict_common(
-            features, idx, final_common,
-            impedance, pair
-        )[0]
-    else:
-        raise ValueError(pinfit)
-
-    return {
-        "C_pF": float(c_pred),
-        "ImagY_S": float(OMEGA*c_pred*1e-12)
-    }
-
-
-print("\n=== EXAMPLE ===")
-print(
-    predict_new(
-        high=list(range(15, 45)),
-        low=list(range(7, 14))
-    )
-)
-
-# ============================================================
-# 16. SAVE
-# ============================================================
+print("\n=== PIN COMPLEX ADMITTANCES ===")
+print(pin_report.round(4).to_string(index=False))
 
 joblib.dump({
-    "impedance": BEST_IMP,
-    "pair": BEST_PAIR,
+    "impedance_mode": BEST_IMP,
+    "pair_mode": BEST_PAIR,
     "pinfit": BEST_PINFIT,
-    "common_params": final_common,
-    "pin_deviations": final_v,
-    "local_coefficients_pf": LOCAL,
+    "common_params": final_t,
+    "individual_deviations": final_v,
     "frequency_hz": FREQ
-}, "all_aggregation_comparison.joblib")
-
-score_df.to_csv(
-    "all_aggregation_scores.csv", index=False
-)
-param_df.to_csv(
-    "all_aggregation_parameters.csv", index=False
-)
-summary.to_csv(
-    "all_aggregation_summary.csv", index=False
-)
-pin_table.to_csv(
-    "all_aggregation_pin_table.csv", index=False
-)
+}, "complex_admittance_model.joblib")
