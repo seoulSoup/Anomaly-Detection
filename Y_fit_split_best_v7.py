@@ -1,416 +1,256 @@
 
+import ast
+import re
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import joblib
 
 # ============================================================
-# 1. FIXED MODEL
+# 1. LOAD FITTED MODEL
 # ============================================================
 
-IMP_MODE = "Parallel"
-PAIR_MODE = "Sum"
+MODEL_PATH = "complex_admittance_model.joblib"
 
-all_idx = np.arange(len(Y))
+model = joblib.load(MODEL_PATH)
 
-# Stage 1: common Pin + cross-SMU pair coefficient
-t_fit = fit_common(
-    all_idx, IMP_MODE, PAIR_MODE
-)
+FREQ = model.get("frequency_hz", 10000.0)
+OMEGA = 2 * np.pi * FREQ
 
-# Stage 2: individual Pin deviations
-# Stage 1 parameters remain fixed.
-v_fit = fit_individual(
-    all_idx, t_fit, IMP_MODE, PAIR_MODE
-)
+# pF -> nS conversion at the measurement frequency
+B_PER_PF = OMEGA * 1e-3
 
-# ============================================================
-# 2. DECOMPOSE PREDICTION
-# ============================================================
+assert model["impedance_mode"] == "SharedPath"
+assert model["pair_mode"] == "Sqrt"
+assert model["pinfit"] == "Individual"
 
-common_c, cross_pf, shared = decode_common(
-    t_fit, IMP_MODE
-)
+t = np.asarray(model["common_params"], dtype=float)
+v = np.asarray(model["individual_deviations"], dtype=float)
 
-c_pin = pin_coefficients(
-    t_fit, v_fit, IMP_MODE
-)
+# Stage 1: common complex pin admittance [nS]
+y0 = complex(t[0], t[1])
 
-# Parallel impedance aggregation
-ch = X["H"] @ c_pin
-cl = X["L"] @ c_pin
+# Shared complex impedance [MOhm]
+z_shared = complex(t[3], t[4])
 
-c_line = np.divide(
-    ch * cl,
-    ch + cl,
-    out=np.zeros_like(ch),
-    where=(ch + cl) > 0
-)
+# Stage 2: individual deviations [nS]
+dg = v[:44] - np.mean(v[:44])
+db = v[44:] - np.mean(v[44:])
 
-# Pair Sum aggregation
-coeff = np.r_[LOCAL, cross_pf]
+y_pin = y0 + dg + 1j * db
 
-zone_contribution = (
-    X["counts"] * coeff[None, :]
-)
+# Cross-SMU coefficient explicitly ignored.
+CROSS_PF = 0.0
 
-c_pair = zone_contribution.sum(axis=1)
+# Fixed local pair coefficients [pF]
+LOCAL_PF = {
+    "even": 1.544,
+    "odd": 0.605,
+    "dist2": 0.175
+}
 
-c_pred = c_line + c_pair
+# Pin -> SMU mapping
+PIN_SMU = {}
 
-# Actual measurements (pF)
-c_actual = Y.copy()
+for g, (start, end) in enumerate([
+    (1, 6),
+    (7, 14),
+    (15, 22),
+    (23, 30),
+    (31, 38),
+    (39, 44)
+]):
+    for p in range(start, end + 1):
+        PIN_SMU[p] = g
 
-error_ff = (c_pred - c_actual) * 1000
-abs_error_ff = np.abs(error_ff)
 
 # ============================================================
-# 3. TOTAL ACCURACY
+# 2. PIN PARSER
 # ============================================================
 
-rmse = np.sqrt(np.mean(error_ff**2))
-mae = np.mean(abs_error_ff)
-median_ae = np.median(abs_error_ff)
-p95 = np.percentile(abs_error_ff, 95)
-bias = np.mean(error_ff)
-
-print("=" * 65)
-print("PARALLEL + PAIR SUM + INDIVIDUAL PIN")
-print("=" * 65)
-
-print(f"Common Pin C  : {common_c:.6f} pF")
-print(f"Cross Pair C  : {cross_pf:.6f} pF")
-print(f"Pin C min/max : {c_pin.min():.4f} / "
-      f"{c_pin.max():.4f} pF")
-
-print("\nFULL-DATA FIT ACCURACY")
-print(f"RMSE         : {rmse:.2f} fF")
-print(f"MAE          : {mae:.2f} fF")
-print(f"Median AE    : {median_ae:.2f} fF")
-print(f"P95 AE       : {p95:.2f} fF")
-print(f"Bias         : {bias:+.2f} fF")
-
-# ============================================================
-# 4. RESULT DATAFRAME
-# ============================================================
-
-results = pd.DataFrame({
-    "High": data["high_pins"],
-    "Low": data["low_pins"],
-    "H_count": X["H"].sum(axis=1).astype(int),
-    "L_count": X["L"].sum(axis=1).astype(int),
-    "Signature": X["signature"],
-
-    "C_actual_pF": c_actual,
-    "C_pred_pF": c_pred,
-
-    "C_line_pF": c_line,
-    "C_pair_pF": c_pair,
-
-    "C_even_pF": zone_contribution[:, 0],
-    "C_odd_pF": zone_contribution[:, 1],
-    "C_dist2_pF": zone_contribution[:, 2],
-    "C_cross_pF": zone_contribution[:, 3],
-
-    "Error_fF": error_ff,
-    "AbsError_fF": abs_error_ff
-})
-
-results["Error_pct"] = (
-    100 * (c_pred - c_actual)
-    / np.where(
-        np.abs(c_actual) > 1e-12,
-        c_actual,
-        np.nan
-    )
-)
-
-# ============================================================
-# 5. WORST MEASUREMENTS
-# ============================================================
-
-cols = [
-    "High", "Low",
-    "H_count", "L_count",
-    "C_actual_pF", "C_pred_pF",
-    "C_line_pF", "C_pair_pF",
-    "Error_fF", "Error_pct"
-]
-
-print("\n" + "=" * 65)
-print("WORST 20 CONFIGURATIONS")
-print("=" * 65)
-
-print(
-    results.sort_values(
-        "AbsError_fF", ascending=False
-    )[cols]
-    .head(20)
-    .round(4)
-    .to_string(index=False)
-)
-
-# ============================================================
-# 6. SIGNATURE ERROR
-# ============================================================
-
-signature_stats = (
-    results.groupby("Signature")
-    .agg(
-        N=("Error_fF", "size"),
-        H_count=("H_count", "first"),
-        L_count=("L_count", "first"),
-        RMSE_fF=(
-            "Error_fF",
-            lambda x: np.sqrt(np.mean(x**2))
-        ),
-        MAE_fF=("AbsError_fF", "mean"),
-        Bias_fF=("Error_fF", "mean")
-    )
-    .reset_index()
-    .sort_values("RMSE_fF", ascending=False)
-)
-
-print("\n" + "=" * 65)
-print("WORST 15 SIGNATURES")
-print("=" * 65)
-
-print(
-    signature_stats.head(15)
-    .round(2)
-    .to_string(index=False)
-)
-
-# ============================================================
-# 7. PIN IMPEDANCES
-# ============================================================
-
-pin_results = pd.DataFrame({
-    "Pin": np.arange(1, 45),
-    "SMU": [
-        PIN_SMU[p] + 1 for p in range(1, 45)
-    ],
-    "C_pin_pF": c_pin,
-    "AbsZ_MOhm": 1 / (
-        OMEGA * c_pin * 1e-12
-    ) / 1e6
-})
-
-print("\n" + "=" * 65)
-print("INDIVIDUAL PIN PARAMETERS")
-print("=" * 65)
-
-print(
-    pin_results.round(4).to_string(index=False)
-)
-
-# ============================================================
-# 8. ACTUAL VS PREDICTED
-# ============================================================
-
-fig, ax = plt.subplots(figsize=(7, 6))
-
-ax.scatter(
-    c_actual,
-    c_pred,
-    alpha=0.65,
-    s=24
-)
-
-lo = min(c_actual.min(), c_pred.min())
-hi = max(c_actual.max(), c_pred.max())
-
-ax.plot(
-    [lo, hi], [lo, hi],
-    "k--", linewidth=1
-)
-
-ax.set_xlabel("Measured C (pF)")
-ax.set_ylabel("Predicted C (pF)")
-ax.set_title(
-    f"Absolute C: RMSE={rmse:.1f} fF"
-)
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-# ============================================================
-# 9. RESIDUAL VS PIN COUNTS
-# ============================================================
-
-fig, ax = plt.subplots(figsize=(9, 5))
-
-sc = ax.scatter(
-    results["H_count"],
-    results["Error_fF"],
-    c=results["L_count"],
-    alpha=0.7
-)
-
-ax.axhline(0, color="black", linestyle="--")
-
-ax.set_xlabel("High Pin Count")
-ax.set_ylabel("Prediction - Actual (fF)")
-ax.set_title("Residual vs High Count")
-ax.grid(True, alpha=0.3)
-
-fig.colorbar(
-    sc, ax=ax, label="Low Pin Count"
-)
-
-plt.tight_layout()
-plt.show()
-
-# ============================================================
-# 10. COMPONENTS VS ACTUAL
-# ============================================================
-
-fig, ax = plt.subplots(figsize=(9, 5))
-
-order = np.argsort(c_actual)
-
-ax.plot(
-    c_actual[order],
-    label="Measured C",
-    linewidth=2
-)
-
-ax.plot(
-    c_line[order],
-    label="Impedance contribution",
-    alpha=0.85
-)
-
-ax.plot(
-    c_pair[order],
-    label="Pair increment",
-    alpha=0.85
-)
-
-ax.plot(
-    c_pred[order],
-    label="Total predicted C",
-    linestyle="--"
-)
-
-ax.set_xlabel("Measurements sorted by actual C")
-ax.set_ylabel("Capacitance (pF)")
-ax.set_title("Contribution Decomposition")
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-# ============================================================
-# 11. SAVE
-# ============================================================
-
-results.to_csv(
-    "parallel_sum_actual_vs_pred.csv",
-    index=False,
-    encoding="utf-8-sig"
-)
-
-signature_stats.to_csv(
-    "parallel_sum_signature_errors.csv",
-    index=False,
-    encoding="utf-8-sig"
-)
-
-pin_results.to_csv(
-    "parallel_sum_pin_impedances.csv",
-    index=False
-)
-
-print("\nSaved result CSV files.")
-
-
-
-
-
-
-
-import numpy as np
-
-# ==========================================================
-# Independent Capacitance Prediction
-#
-# Required fitted parameters:
-#   c_pin   : array of 44 effective pin C values [pF]
-#   cross_pf: fitted cross-SMU pair coefficient [pF]
-#
-# Input:
-#   high: iterable of pin numbers (1~44)
-#   low : iterable of pin numbers (1~44)
-#
-# Output:
-#   Predicted capacitance [pF]
-# ==========================================================
-
-def predict_cap(high, low):
-    high = tuple(int(p) for p in high)
-    low = tuple(int(p) for p in low)
-
-    if not high or not low:
-        raise ValueError("High/Low cannot be empty")
-
-    if len(set(high)) != len(high):
-        raise ValueError("Duplicate High pins")
-
-    if len(set(low)) != len(low):
-        raise ValueError("Duplicate Low pins")
-
-    if set(high) & set(low):
-        raise ValueError("High and Low overlap")
-
-    if any(p < 1 or p > 44 for p in high + low):
+def parse_pins(value):
+    if isinstance(value, str):
+        try:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, (list, tuple, set)):
+                value = parsed
+            else:
+                value = re.findall(r"\d+", value)
+        except (ValueError, SyntaxError):
+            value = re.findall(r"\d+", value)
+
+    pins = tuple(sorted(int(p) for p in value))
+
+    if not pins:
+        raise ValueError("Empty pin selection")
+
+    if len(pins) != len(set(pins)):
+        raise ValueError("Duplicate pins")
+
+    if any(p < 1 or p > 44 for p in pins):
         raise ValueError("Pin must be between 1 and 44")
 
-    # 1. Parallel aggregation on each side,
-    #    followed by series combination.
-    ch = sum(c_pin[p - 1] for p in high)
-    cl = sum(c_pin[p - 1] for p in low)
+    return pins
 
-    c_line = ch * cl / (ch + cl)
 
-    # 2. Pair Sum correction.
-    ne = no = n2 = ncross = 0
+# ============================================================
+# 3. SHARED PATH AGGREGATION
+#
+# y_pin unit   : nS
+# z_shared unit: MOhm
+#
+# 1 MOhm * 1 nS = 0.001
+# ============================================================
 
-    for h in high:
-        for l in low:
-            if PIN_SMU[h] != PIN_SMU[l]:
-                ncross += 1
-                continue
-
-            d = abs(h - l)
-
-            if d == 1:
-                if max(h, l) % 2 == 0:
-                    ne += 1
-                else:
-                    no += 1
-            elif d == 2:
-                n2 += 1
-
-    c_pair = (
-        1.544 * ne
-        + 0.605 * no
-        + 0.175 * n2
-        + cross_pf * ncross
+def shared_aggregate(pins):
+    y_sum = np.sum(
+        y_pin[np.asarray(pins, dtype=int) - 1]
     )
 
-    return float(c_line + c_pair)
+    denominator = (
+        1.0 + 1e-3 * z_shared * y_sum
+    )
+
+    if abs(denominator) < 1e-12:
+        raise ZeroDivisionError(
+            "SharedPath denominator is near zero"
+        )
+
+    return y_sum / denominator
 
 
-# ==========================================================
-# Example
-# ==========================================================
+# ============================================================
+# 4. PAIR SQRT AGGREGATION
+#
+# Sum:
+#   Sum of coefficients for all H-L pairs.
+#
+# MaxPerPin:
+#   Mean of:
+#       Sum of maximum coefficients for each H pin
+#       Sum of maximum coefficients for each L pin
+#
+# Sqrt:
+#   sqrt(Sum * MaxPerPin)
+#
+# Output in pF.
+# ============================================================
+
+def pair_sqrt(high, low):
+    pair_values = np.zeros(
+        (len(high), len(low)),
+        dtype=float
+    )
+
+    for i, h in enumerate(high):
+        for j, l in enumerate(low):
+
+            if PIN_SMU[h] != PIN_SMU[l]:
+                # Cross-SMU contribution ignored
+                c = 0.0
+
+            else:
+                d = abs(h - l)
+
+                if d == 1:
+                    if max(h, l) % 2 == 0:
+                        c = LOCAL_PF["even"]
+                    else:
+                        c = LOCAL_PF["odd"]
+
+                elif d == 2:
+                    c = LOCAL_PF["dist2"]
+
+                else:
+                    c = 0.0
+
+            pair_values[i, j] = c
+
+    pair_sum = np.sum(pair_values)
+
+    max_h = np.max(pair_values, axis=1).sum()
+    max_l = np.max(pair_values, axis=0).sum()
+
+    max_per_pin = 0.5 * (max_h + max_l)
+
+    return float(
+        np.sqrt(
+            max(pair_sum * max_per_pin, 0.0)
+        )
+    )
+
+
+# ============================================================
+# 5. INDEPENDENT OPEN CAPACITANCE PREDICTION
+# ============================================================
+
+def predict_open_cap(high, low, return_detail=False):
+    high = parse_pins(high)
+    low = parse_pins(low)
+
+    if set(high) & set(low):
+        raise ValueError("High and Low cannot overlap")
+
+    # Complex admittance aggregation on both sides.
+    yh = shared_aggregate(high)
+    yl = shared_aggregate(low)
+
+    denominator = yh + yl
+
+    if abs(denominator) < 1e-12:
+        raise ZeroDivisionError(
+            "H/L series admittance denominator near zero"
+        )
+
+    y_line_ns = yh * yl / denominator
+
+    # Fixed local pair contribution.
+    c_pair_pf = pair_sqrt(high, low)
+
+    # Pair increment as capacitive susceptance [nS].
+    y_pair_ns = 1j * B_PER_PF * c_pair_pf
+
+    # Total complex admittance [nS].
+    y_total_ns = y_line_ns + y_pair_ns
+
+    # Parallel equivalent capacitance [pF].
+    c_pred_pf = y_total_ns.imag / B_PER_PF
+
+    if not return_detail:
+        return float(c_pred_pf)
+
+    return {
+        "C_pred_pF": float(c_pred_pf),
+        "C_line_pF": float(y_line_ns.imag / B_PER_PF),
+        "C_pair_pF": float(c_pair_pf),
+        "G_pred_nS": float(y_total_ns.real),
+        "Y_pred_S": complex(y_total_ns * 1e-9)
+    }
+
+
+# ============================================================
+# 6. EXAMPLES
+# ============================================================
 
 high = list(range(15, 45))
 low = list(range(7, 14))
 
-c_pred_pf = predict_cap(high, low)
+# Return capacitance only [pF]
+c_pred = predict_open_cap(high, low)
 
-print(f"Predicted C = {c_pred_pf:.6f} pF")
+print(f"Predicted Open C = {c_pred:.6f} pF")
 
+# Return decomposition
+detail = predict_open_cap(
+    high, low, return_detail=True
+)
+
+print(detail)
+
+# DataFrame example:
+#
+# open_df["C_pred_pF"] = [
+#     predict_open_cap(h, l)
+#     for h, l in zip(
+#         open_df["high_pins"],
+#         open_df["low_pins"]
+#     )
+# ]
