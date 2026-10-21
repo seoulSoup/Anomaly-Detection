@@ -19,7 +19,7 @@ CFG = dict(
     freq_hz=1e4,
     c_keysight='C_keysight', g_keysight='G_keysight',
     c_v93k='C_v93k', g_v93k='G_v93k',
-    high='high_pins', low='low_pins',
+    high='high_pins', low='low_pins', para_name='paraName',
     out_dir='rlgc_autofit',
     seed=42, test_fraction=0.25,
     # QUICK mode evaluates many architectures; finalist training is deeper.
@@ -33,7 +33,15 @@ CFG = dict(
     t_models=('rlgc','independent'),
     # Fit all on same initial grouped split. Finalists use repeated grouped splits.
     cv_group='configuration', # or 'smu_signature'
-    # numerical residual normalization in SI
+    # Per-paraName standard deviations are computed on training rows ONLY.
+    # Small groups fall back to the global train std. Floors avoid division by zero.
+    std_min_count=3, std_floor_fraction=0.05,
+    c_std_floor_f=1e-16, g_std_floor_s=1e-13,
+    # C objective: mean abs standardized error + softmax-weighted max approx.
+    # G is optional; set g_loss_weight>0 to jointly optimize C and G.
+    mean_weight=1.0, max_weight=1.0, softmax_beta=8.0,
+    g_loss_weight=0.0,
+    # Legacy global scales remain only for diagnostic combined metric.
     c_scale_f=5e-13, g_scale_s=1e-9,
     # log-domain starting physical values; not converted units
     r_init_ohm=1e6, l_init_h=1e-4, g_init_s=1e-8, c_init_f=1e-12,
@@ -77,7 +85,7 @@ def _pair_zone(h,l):
 
 def _build_data(frame,cfg):
     d=frame.copy().reset_index(drop=True)
-    cols=[cfg[k] for k in ('c_keysight','g_keysight','c_v93k','g_v93k','high','low')]
+    cols=[cfg[k] for k in ('c_keysight','g_keysight','c_v93k','g_v93k','high','low','para_name')]
     if any(c not in d for c in cols):
         raise ValueError(f'Missing columns: {set(cols)-set(d.columns)}')
     highs=[_parse_pins(z) for z in d[cfg['high']]]
@@ -96,7 +104,8 @@ def _build_data(frame,cfg):
                     tuple(sum(p in s for p in l) for s in SMUS)) for h,l in zip(highs,lows)]
     groups=np.array(cfg_keys if cfg['cv_group']=='configuration' else signatures)
     if np.unique(groups).size<2: raise ValueError('At least two distinct CV groups required')
-    return dict(frame=d,highs=highs,lows=lows,yk=yk,yv=yv,w=w,n=n,groups=groups)
+    return dict(frame=d,highs=highs,lows=lows,yk=yk,yv=yv,w=w,n=n,groups=groups,
+                para=d[cfg['para_name']].fillna('__MISSING__').astype(str).to_numpy())
 
 
 def _pair_features(highs,lows,mode):
@@ -213,7 +222,58 @@ def _predict_torch(v,X,YV,cfg,metadata):
     return result
 
 
-def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1):
+def _train_std_stats(y_reference, para, train_idx, cfg):
+    """Fit per-paraName standard deviations on training targets (SI units)."""
+    train_idx=np.asarray(train_idx, dtype=int)
+    p=np.asarray(para)[train_idx]
+    y=y_reference[train_idx]
+    c=y.imag/(2*np.pi*cfg['freq_hz']); g=y.real
+    global_c=float(np.std(c,ddof=1)) if len(c)>1 else 0.0
+    global_g=float(np.std(g,ddof=1)) if len(g)>1 else 0.0
+    floor_c=max(cfg['c_std_floor_f'],cfg['std_floor_fraction']*global_c)
+    floor_g=max(cfg['g_std_floor_s'],cfg['std_floor_fraction']*global_g)
+    fallback=(max(global_c,floor_c),max(global_g,floor_g))
+    stats={}
+    for name in np.unique(p):
+        inds=np.flatnonzero(p==name)
+        if len(inds)<cfg['std_min_count']:
+            stats[name]=fallback
+        else:
+            cs=float(np.std(c[inds],ddof=1))
+            gs=float(np.std(g[inds],ddof=1))
+            stats[name]=(max(cs,floor_c),max(gs,floor_g))
+    return dict(per_para=stats,fallback=fallback)
+
+
+def _row_std(stats, names):
+    values=np.asarray([stats['per_para'].get(name,stats['fallback']) for name in names],dtype=float)
+    return values[:,0],values[:,1]
+
+
+def _smooth_mean_max(e,cfg):
+    """Mean absolute error + softmax-weighted maximum approximation."""
+    a=torch.sqrt(e*e+1e-12)
+    weights=torch.softmax(cfg['softmax_beta']*a,dim=0)
+    return cfg['mean_weight']*a.mean()+cfg['max_weight']*(weights*a).sum()
+
+
+def _normalized_objective_numpy(actual,pred,w,names,stats,cfg):
+    if not np.isfinite(pred).all(): return np.inf
+    sc,sg=_row_std(stats,names)
+    e=np.sqrt(((pred.imag-actual.imag)/w/sc)**2+1e-12)
+    logits=cfg['softmax_beta']*e
+    weights=np.exp(logits-np.max(logits));weights/=weights.sum()
+    loss=cfg['mean_weight']*e.mean()+cfg['max_weight']*np.dot(weights,e)
+    if cfg['g_loss_weight']:
+        eg=np.sqrt(((pred.real-actual.real)/sg)**2+1e-12)
+        logits=cfg['softmax_beta']*eg
+        wg=np.exp(logits-np.max(logits));wg/=wg.sum()
+        loss+=cfg['g_loss_weight']*(cfg['mean_weight']*eg.mean()+cfg['max_weight']*np.dot(wg,eg))
+    return float(loss)
+
+
+def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1,
+         c_stds=None,g_stds=None):
     n,m=Xnp.shape
     if m==0: return None
     dtype=cfg['dtype']; cdtype=torch.complex128
@@ -226,16 +286,18 @@ def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1):
     if metadata['offset']=='global': bounds.extend([(-1e4,1e4)]*2)
     rng=np.random.default_rng(seed)
     best=None
-    c_scale=cfg['c_scale_f'];g_scale=cfg['g_scale_s'];delta=cfg['robust_delta']
+    if c_stds is None: raise ValueError('Missing training-only C stds')
+    SC=torch.as_tensor(c_stds,dtype=dtype)
+    SG=torch.as_tensor(g_stds if g_stds is not None else np.ones(n),dtype=dtype)
 
     def fun_grad(q):
         v=torch.tensor(q,dtype=dtype,requires_grad=True)
         pred=_predict_torch(v,X,YV,cfg,md)
-        err_c=(pred.imag-YK.imag)/(2*np.pi*cfg['freq_hz']*c_scale)
-        err_g=(pred.real-YK.real)/g_scale
-        e=torch.cat([err_c,err_g])
-        # Smooth pseudo-Huber avoids single catastrophic inversion dominating
-        loss=(delta**2*(torch.sqrt(1+(e/delta)**2)-1)).mean()
+        err_c=(pred.imag-YK.imag)/(2*np.pi*cfg['freq_hz'])/SC
+        loss=_smooth_mean_max(err_c,cfg)
+        if cfg['g_loss_weight']:
+            err_g=(pred.real-YK.real)/SG
+            loss=loss+cfg['g_loss_weight']*_smooth_mean_max(err_g,cfg)
         # Small log ridge to avoid unconstrained degrees of freedom
         loss=loss+cfg['log_regularization']*torch.mean(v[:4*m]**2)
         loss.backward()
@@ -285,13 +347,15 @@ def run_rlgc_search(df,**overrides):
     np.random.seed(cfg['seed']);torch.set_num_threads(max(1,min(torch.get_num_threads(),8)))
     info=_build_data(df,cfg)
     out=Path(cfg['out_dir']);out.mkdir(parents=True,exist_ok=True)
-    n=info['n'];yv=info['yv'];yk=info['yk'];w=info['w'];groups=info['groups']
+    n=info['n'];yv=info['yv'];yk=info['yk'];w=info['w'];groups=info['groups'];para=info['para']
     specs=list(product(cfg['families'],cfg['aggregations'],
                        cfg['t_aggregations'],cfg['t_models'],cfg['offsets']))
     if cfg['max_candidates'] is not None: specs=specs[:cfg['max_candidates']]
     print(f'Rows={n}, distinct configurations={len(set(groups))}, candidates={len(specs)}',flush=True)
     tr,te=next(GroupShuffleSplit(n_splits=1,test_size=cfg['test_fraction'],
                                   random_state=cfg['seed']).split(np.arange(n),groups=groups))
+    screen_stats=_train_std_stats(yk,para,tr,cfg)
+    screen_sc,screen_sg=_row_std(screen_stats,para[tr])
     screen=[];start=time.time()
     for idx,(family,agg,tagg,tm,offset) in enumerate(specs):
         X,active=_make_feature(info['highs'],info['lows'],family,agg)
@@ -299,9 +363,11 @@ def run_rlgc_search(df,**overrides):
                       t_model=tm,offset=offset,active=active)
         try:
             fitted=_fit(X[tr],yv[tr],yk[tr],metadata,cfg,
-                        cfg['screen_maxiter'],seed=cfg['seed'],starts=cfg['screen_starts'])
+                        cfg['screen_maxiter'],seed=cfg['seed'],starts=cfg['screen_starts'],
+                        c_stds=screen_sc,g_stds=screen_sg)
             yp=_predict_numpy(fitted,X[te],yv[te],cfg)
             m=_score(yk[te],yp,w,cfg)
+            m['NormalizedObjective']=_normalized_objective_numpy(yk[te],yp,w,para[te],screen_stats,cfg)
         except Exception as exc:
             m=dict(C_RMSE_F=np.inf,C_MAE_F=np.inf,G_RMSE_S=np.inf,G_MAE_S=np.inf,Combined=np.inf)
             print('ERROR',idx,family,agg,tagg,tm,offset,str(exc)[:100],flush=True)
@@ -311,7 +377,7 @@ def run_rlgc_search(df,**overrides):
             print(f'Screen {idx+1}/{len(specs)} | best C RMSE=' 
                   f'{min(x["C_RMSE_F"] for x in screen):.6e} F | '
                   f'{time.time()-start:.0f}s',flush=True)
-    screen_df=pd.DataFrame(screen).sort_values(['C_RMSE_F','Combined']).reset_index(drop=True)
+    screen_df=pd.DataFrame(screen).sort_values(['NormalizedObjective','C_RMSE_F']).reset_index(drop=True)
     screen_df.to_csv(out/'screen.csv',index=False)
     top_ids=screen_df.loc[np.isfinite(screen_df['C_RMSE_F']),'id'].head(cfg['top_k']).tolist()
     if not top_ids: raise RuntimeError('All models failed. See screen.csv')
@@ -320,6 +386,8 @@ def run_rlgc_search(df,**overrides):
                          random_state=cfg['seed']+100)
     fold_rows=[]
     for fold,(train,test) in enumerate(cv.split(np.arange(n),groups=groups),1):
+        fold_stats=_train_std_stats(yk,para,train,cfg)
+        fold_sc,fold_sg=_row_std(fold_stats,para[train])
         for i in top_ids:
             family,agg,tagg,tm,offset=specs[i]
             X,active=_make_feature(info['highs'],info['lows'],family,agg)
@@ -327,28 +395,32 @@ def run_rlgc_search(df,**overrides):
                       t_model=tm,offset=offset,active=active)
             try:
                 model=_fit(X[train],yv[train],yk[train],meta,cfg,cfg['final_maxiter'],
-                           seed=cfg['seed']+fold,starts=cfg['final_starts'])
+                           seed=cfg['seed']+fold,starts=cfg['final_starts'],
+                           c_stds=fold_sc,g_stds=fold_sg)
                 yp=_predict_numpy(model,X[test],yv[test],cfg)
                 ms=_score(yk[test],yp,w,cfg)
+                ms['NormalizedObjective']=_normalized_objective_numpy(yk[test],yp,w,para[test],fold_stats,cfg)
             except Exception as exc:
                 print('FINAL ERROR',i,str(exc)[:100],flush=True)
-                ms=dict(C_RMSE_F=np.inf,C_MAE_F=np.inf,G_RMSE_S=np.inf,G_MAE_S=np.inf,Combined=np.inf)
+                ms=dict(C_RMSE_F=np.inf,C_MAE_F=np.inf,G_RMSE_S=np.inf,G_MAE_S=np.inf,Combined=np.inf,NormalizedObjective=np.inf)
             fold_rows.append(dict(id=i,Fold=fold,Family=family,Aggregation=agg,
                                   T_aggregation=tagg,T_model=tm,Offset=offset,**ms))
             print(f'Final fold {fold} id {i}: C={ms["C_RMSE_F"]:.6e} F, '
                   f'G={ms["G_RMSE_S"]:.6e} S',flush=True)
     folds=pd.DataFrame(fold_rows);folds.to_csv(out/'folds.csv',index=False)
     ranking=(folds.groupby(['id','Family','Aggregation','T_aggregation','T_model','Offset'])
-             [['C_RMSE_F','C_MAE_F','G_RMSE_S','G_MAE_S','Combined']]
-             .mean().reset_index().sort_values(['C_RMSE_F','Combined']))
+             [['C_RMSE_F','C_MAE_F','G_RMSE_S','G_MAE_S','Combined','NormalizedObjective']]
+             .mean().reset_index().sort_values(['NormalizedObjective','C_RMSE_F']))
     ranking.to_csv(out/'ranking.csv',index=False)
     print('\n=== VALIDATION RANKING ===\n',ranking.to_string(index=False),flush=True)
     best_id=int(ranking.iloc[0]['id'])
     family,agg,tagg,tm,offset=specs[best_id]
     X,active=_make_feature(info['highs'],info['lows'],family,agg)
     meta=dict(family=family,aggregation=agg,t_aggregation=tagg,t_model=tm,offset=offset,active=active)
+    full_stats=_train_std_stats(yk,para,np.arange(n),cfg)
+    full_sc,full_sg=_row_std(full_stats,para)
     model=_fit(X,yv,yk,meta,cfg,cfg['refit_maxiter'],seed=cfg['seed']+999,
-               starts=max(cfg['final_starts'],3))
+               starts=max(cfg['final_starts'],3),c_stds=full_sc,g_stds=full_sg)
     yp=_predict_numpy(model,X,yv,cfg)
     report=info['frame'].copy()
     report['C_pred_F']=yp.imag/w
@@ -362,6 +434,7 @@ def run_rlgc_search(df,**overrides):
     joblib.dump(payload,out/'winner.joblib')
     print('\n=== WINNER ===',ranking.iloc[0].to_dict(),flush=True)
     print('IN-SAMPLE:',_score(yk,yp,w,cfg),flush=True)
+    print('IN-SAMPLE NORMALIZED OBJECTIVE:',_normalized_objective_numpy(yk,yp,w,para,full_stats,cfg),flush=True)
     print('Files:',out.resolve(),flush=True)
     return dict(ranking=ranking,screen=screen_df,folds=folds,model=model,
                 predictions=report,config=cfg)
