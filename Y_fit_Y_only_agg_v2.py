@@ -167,3 +167,61 @@ print(
 
 print("\n=== COEFFICIENTS ===")
 print(coef_df.round(4).to_string(index=False))
+
+
+
+
+===============<=<÷>÷[÷[÷>=</<=>÷
+
+
+import numpy as np
+import pandas as pd
+
+diagnostics = {}
+predictions = {}
+
+for pm in PAIR_MODES:
+    alpha = fit_pair_nonlinear(tr, c_tr, pm)
+
+    correction = aggregate_pair_matrix(
+        H[te], L[te], alpha, pm
+    )
+
+    predictions[pm] = c_te + correction
+
+    diagnostics[pm] = {
+        "Even_pF": alpha[0],
+        "Odd_pF": alpha[1],
+        "Dist2_pF": alpha[2],
+        "Correction_mean_fF": correction.mean() * 1000,
+        "Correction_std_fF": correction.std() * 1000,
+        "Correction_max_fF": correction.max() * 1000,
+        "RMSE_fF": np.sqrt(
+            np.mean(
+                (predictions[pm] - C_TRUE[te])**2
+            )
+        ) * 1000
+    }
+
+print(pd.DataFrame(diagnostics).T.round(7))
+
+print("\n=== Pairwise prediction differences [fF] ===")
+for i, m1 in enumerate(PAIR_MODES):
+    for m2 in PAIR_MODES[i+1:]:
+        delta = (
+            predictions[m1] - predictions[m2]
+        ) * 1000
+
+        print(
+            f"{m1:12} vs {m2:12}",
+            f"MeanAbs={np.abs(delta).mean():.9f}",
+            f"MaxAbs={np.abs(delta).max():.9f}"
+        )
+
+print("\n=== Base residual sign ===")
+residual = C_TRUE[tr] - c_tr
+
+print("Positive residual ratio:", np.mean(residual > 0))
+print("Negative residual ratio:", np.mean(residual < 0))
+print("Mean residual [fF]:", residual.mean() * 1000)
+
