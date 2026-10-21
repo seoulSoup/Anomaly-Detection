@@ -604,3 +604,441 @@ pin_table.to_csv(
     "pin_impedance_only_parameters.csv",
     index=False
 )
+
+
+
+
+
+
+
+
+////////////////////////////
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+
+from sklearn.model_selection import GroupShuffleSplit
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+MODE = "SharedPath"
+FREQ = 10000.0
+OMEGA = 2 * np.pi * FREQ
+
+N_FOLDS = 3
+TEST_SIZE = 0.25
+SEED = 42
+
+PAIR_NAMES = ["Even", "Odd", "Dist2", "CrossSMU"]
+
+# Regularization of residual pair coefficients.
+# Each coefficient is in pF.
+# Coefficients can be negative: they represent residuals.
+PAIR_PRIOR_SIGMA_PF = np.array([
+    0.5, 0.5, 0.2, 0.1
+])
+
+PAIR_RIDGE_WEIGHT = 1.0
+
+SMU_MAP = np.zeros(44, dtype=int)
+
+for g, group in enumerate(SMUS):
+    for p in group:
+        SMU_MAP[p - 1] = g
+
+
+# ============================================================
+# 2. PRECOMPUTE PAIR COUNT FEATURES
+#
+# Columns:
+#   Even, Odd, Dist2, CrossSMU
+#
+# Same-SMU distance >= 3 contributes zero.
+# ============================================================
+
+PAIR_ZONE = np.zeros((4, 44, 44), dtype=float)
+
+for a in range(44):
+    for b in range(44):
+        if a == b:
+            continue
+
+        if SMU_MAP[a] != SMU_MAP[b]:
+            zone = 3
+        elif abs(a - b) == 1:
+            zone = 0 if max(a, b) % 2 == 1 else 1
+        elif abs(a - b) == 2:
+            zone = 2
+        else:
+            continue
+
+        PAIR_ZONE[zone, a, b] = 1.0
+
+
+def make_pair_features(h, l):
+    return np.column_stack([
+        np.sum(
+            (h @ PAIR_ZONE[z]) * l,
+            axis=1
+        )
+        for z in range(4)
+    ])
+
+
+PAIR_X = make_pair_features(H, L)
+
+print("Pair counts (total):")
+print(
+    dict(zip(PAIR_NAMES, PAIR_X.sum(axis=0)))
+)
+
+
+# ============================================================
+# 3. FIT RESIDUAL PAIR COEFFICIENTS
+#
+# Pin model remains completely frozen.
+#
+# Target:
+#   C_actual - C_SharedPath
+#
+# Least squares + zero-centered regularization.
+#
+# Return alpha [pF].
+# ============================================================
+
+def fit_pair_residual(
+    train_idx,
+    c_base_pred,
+    num_zones=4
+):
+    Xp = PAIR_X[train_idx, :num_zones]
+
+    target = (
+        C_TRUE[train_idx]
+        - c_base_pred
+    )
+
+    # Penalize coefficients in pF with
+    # zero-centered ridge prior.
+    sigma = PAIR_PRIOR_SIGMA_PF[:num_zones]
+
+    regularizer = np.diag(
+        PAIR_RIDGE_WEIGHT / sigma
+    )
+
+    X_aug = np.vstack([
+        Xp, regularizer
+    ])
+
+    y_aug = np.r_[
+        target, np.zeros(num_zones)
+    ]
+
+    alpha = np.linalg.lstsq(
+        X_aug, y_aug, rcond=None
+    )[0]
+
+    return alpha
+
+
+def predict_pair_increment(idx, alpha):
+    return (
+        PAIR_X[idx, :len(alpha)] @ alpha
+    )
+
+
+# ============================================================
+# 4. METRICS
+# ============================================================
+
+def c_metrics(actual, predicted):
+    err = (predicted - actual) * 1000
+
+    return {
+        "RMSE_fF": np.sqrt(np.mean(err**2)),
+        "MAE_fF": np.mean(np.abs(err)),
+        "MedianAE_fF": np.median(np.abs(err)),
+        "P95_fF": np.percentile(np.abs(err), 95),
+        "Bias_fF": np.mean(err)
+    }
+
+
+# ============================================================
+# 5. GROUPED CROSS VALIDATION
+#
+# SharedPath model fitted on Train ONLY.
+# Pair coefficients fitted on Train residuals ONLY.
+#
+# Same held-out observations for all 3 models.
+# ============================================================
+
+rows = []
+coefficient_rows = []
+oof_rows = []
+
+for split_name, groups in [
+    ("RandomConfig", CONFIG),
+    ("UnseenSignature", SIGNATURE)
+]:
+    splitter = GroupShuffleSplit(
+        n_splits=N_FOLDS,
+        test_size=TEST_SIZE,
+        random_state=SEED
+    )
+
+    for fold, (train, test) in enumerate(
+        splitter.split(H, groups=groups),
+        start=1
+    ):
+        # ------------------------------------
+        # Stage 1: fit SharedPath + Individual
+        # ------------------------------------
+        t = fit_common(train, MODE)
+        v = fit_individual(train, t, MODE)
+
+        y_pin_fold, zs_fold = unpack_individual(
+            t, v, MODE
+        )
+
+        # Base C on both Train and Test
+        c_base_train, _ = predict_cg(
+            H[train], L[train],
+            y_pin_fold, MODE, zs_fold
+        )
+
+        c_base_test, g_base_test = predict_cg(
+            H[test], L[test],
+            y_pin_fold, MODE, zs_fold
+        )
+
+        # ------------------------------------
+        # Stage 2: residual pair fitting
+        # ------------------------------------
+        alpha3 = fit_pair_residual(
+            train, c_base_train, num_zones=3
+        )
+
+        alpha4 = fit_pair_residual(
+            train, c_base_train, num_zones=4
+        )
+
+        predictions = {
+            "Base": c_base_test,
+            "Pair3": (
+                c_base_test
+                + predict_pair_increment(test, alpha3)
+            ),
+            "Pair4": (
+                c_base_test
+                + predict_pair_increment(test, alpha4)
+            )
+        }
+
+        for name, pred in predictions.items():
+            m = c_metrics(C_TRUE[test], pred)
+
+            rows.append({
+                "Split": split_name,
+                "Fold": fold,
+                "Model": name,
+                **m
+            })
+
+            for row_idx, cp, ca in zip(
+                test, pred, C_TRUE[test]
+            ):
+                oof_rows.append({
+                    "Split": split_name,
+                    "Fold": fold,
+                    "Model": name,
+                    "Row": int(row_idx),
+                    "C_actual_pF": float(ca),
+                    "C_pred_pF": float(cp),
+                    "Error_fF": float(
+                        (cp - ca) * 1000
+                    )
+                })
+
+        coefficient_rows.append({
+            "Split": split_name,
+            "Fold": fold,
+            "Even_pF": alpha4[0],
+            "Odd_pF": alpha4[1],
+            "Dist2_pF": alpha4[2],
+            "Cross_pF": alpha4[3]
+        })
+
+        print(
+            f"{split_name} Fold {fold}: "
+            + " | ".join(
+                f"{name}: "
+                f"{c_metrics(C_TRUE[test], p)['RMSE_fF']:.1f} fF"
+                for name, p in predictions.items()
+            )
+        )
+
+
+# ============================================================
+# 6. REPORT
+# ============================================================
+
+score_df = pd.DataFrame(rows)
+coeff_df = pd.DataFrame(coefficient_rows)
+oof_df = pd.DataFrame(oof_rows)
+
+summary = (
+    score_df.groupby(["Split", "Model"])
+    .agg(
+        RMSE_mean=("RMSE_fF", "mean"),
+        RMSE_std=("RMSE_fF", "std"),
+        MAE_mean=("MAE_fF", "mean"),
+        MedianAE_mean=("MedianAE_fF", "mean"),
+        P95_mean=("P95_fF", "mean"),
+        Bias_mean=("Bias_fF", "mean")
+    )
+    .reset_index()
+)
+
+print("\n=== MODEL COMPARISON ===")
+print(summary.round(3).to_string(index=False))
+
+print("\n=== PAIR COEFFICIENT STABILITY ===")
+print(
+    coeff_df.groupby("Split")[
+        ["Even_pF", "Odd_pF", "Dist2_pF", "Cross_pF"]
+    ].agg(["mean", "std"])
+    .round(5)
+    .to_string()
+)
+
+
+# ============================================================
+# 7. FINAL FIT ON ALL DATA
+#
+# For deployment only.
+# This in-sample fit is NOT the validation score.
+# ============================================================
+
+all_idx = np.arange(len(C_TRUE))
+
+t_final = fit_common(all_idx, MODE)
+v_final = fit_individual(
+    all_idx, t_final, MODE
+)
+
+y_pin_final, zs_final = unpack_individual(
+    t_final, v_final, MODE
+)
+
+c_base_all, g_base_all = predict_cg(
+    H, L, y_pin_final, MODE, zs_final
+)
+
+alpha_final = fit_pair_residual(
+    all_idx,
+    c_base_all,
+    num_zones=4
+)
+
+c_pred_final = (
+    c_base_all
+    + PAIR_X @ alpha_final
+)
+
+print("\n=== FINAL PAIR RESIDUAL COEFFICIENTS ===")
+
+for name, value in zip(PAIR_NAMES, alpha_final):
+    print(f"{name:10}: {value:+.6f} pF")
+
+print("\n=== FULL DATA FIT ===")
+print(
+    c_metrics(C_TRUE, c_pred_final)
+)
+
+
+# ============================================================
+# 8. INDEPENDENT PREDICTION
+#
+# Requires only High / Low after fitting.
+# ============================================================
+
+def predict_open_cap(high, low, detail=False):
+    h, l, _, _ = make_features([high], [low])
+
+    c_base, g_base = predict_cg(
+        h, l,
+        y_pin_final, MODE, zs_final
+    )
+
+    xp = make_pair_features(h, l)
+
+    increment = float(
+        (xp @ alpha_final)[0]
+    )
+
+    c_total = float(c_base[0] + increment)
+
+    if not detail:
+        return c_total
+
+    return {
+        "C_pF": c_total,
+        "C_base_pF": float(c_base[0]),
+        "C_pair_increment_pF": increment,
+        "G_nS": float(g_base[0]),
+        "Y_S": complex(
+            (
+                g_base[0]
+                + 1j * B_PER_PF * c_total
+            ) * 1e-9
+        ),
+        "Pair_counts": dict(
+            zip(PAIR_NAMES, xp[0].astype(int))
+        )
+    }
+
+
+# ============================================================
+# 9. EXAMPLE
+# ============================================================
+
+result = predict_open_cap(
+    high=list(range(15, 45)),
+    low=list(range(7, 14)),
+    detail=True
+)
+
+print("\n=== INDEPENDENT PREDICTION ===")
+print(result)
+
+
+# ============================================================
+# 10. SAVE
+# ============================================================
+
+joblib.dump({
+    "model": "SharedPathIndividual+Pair4",
+    "y_pin_nS": y_pin_final,
+    "z_shared_MOhm": zs_final,
+    "pair_coefficients_pF": alpha_final,
+    "frequency_hz": FREQ
+}, "shared_individual_pair_residual.joblib")
+
+score_df.to_csv(
+    "shared_pair_cv.csv", index=False
+)
+
+coeff_df.to_csv(
+    "shared_pair_coeff_stability.csv",
+    index=False
+)
+
+oof_df.to_csv(
+    "shared_pair_oof_predictions.csv",
+    index=False
+)
+
