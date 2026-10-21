@@ -6,34 +6,16 @@ import pandas as pd
 from scipy.optimize import least_squares
 from sklearn.model_selection import GroupShuffleSplit
 
-# ==========================================================
-# SETTINGS
-# ==========================================================
+# ============================================================
+# 0. SETTINGS - ALL PHYSICAL QUANTITIES IN SI UNITS
+# ============================================================
 
-FREQ = 10000.0
-B_PER_PF = 2 * np.pi * FREQ * 1e-3
-
-C_UNIT = "F"
-G_UNIT = "S"
-
-C_FACTORS = {"F": 1e12, "pF": 1.0}
-G_FACTORS = {"S": 1e9, "uS": 1e3, "nS": 1.0}
+FREQ_HZ = 10000.0
+OMEGA = 2.0 * np.pi * FREQ_HZ
 
 N_FOLDS = 5
-SEED = 42
 TEST_SIZE = 0.25
-
-# Normalize C/G residuals.
-C_SCALE_PF = 0.5
-G_SCALE_NS = 1.0
-
-# Parameter units:
-# Zs: MOhm
-# Yp: nS
-#
-# Initial broad exploratory bounds.
-ZS_BOUND_MOHM = 100.0
-YP_BOUND_NS = 100.0
+SEED = 42
 
 MODELS = [
     "Identity",
@@ -42,141 +24,244 @@ MODELS = [
     "Series+Shunt"
 ]
 
-# ==========================================================
-# DATA
-# ==========================================================
+# Objective residual scales (SI)
+# These determine relative importance of C and G.
+C_SCALE_F = 5e-13
+G_SCALE_S = 1e-9
+
+# Physical parameter bounds (SI)
+Z_BOUND_OHM = 1e8
+YP_BOUND_S = 1e-7
+
+# Numerical optimization references.
+# These are used ONLY to parameterize dimensionless
+# optimizer variables. All physical calculations use
+# Ohm, S, and F.
+Z_REF_OHM = 1e6
+YP_REF_S = 1e-10
+
+MAX_NFEV = 1000
+MIN_DENOMINATOR = 0.05
+
+# ============================================================
+# 1. DATA
+# ============================================================
 
 data = df.copy().reset_index(drop=True)
 
 required = [
-    "C_keysight", "G_keysight",
-    "C_v93k", "G_v93k"
+    "C_keysight",
+    "G_keysight",
+    "C_v93k",
+    "G_v93k",
+    "high_pins",
+    "low_pins"
 ]
 
-for name in required:
-    if name not in data:
-        raise ValueError(f"Missing column: {name}")
+missing = set(required) - set(data.columns)
 
-ck = data["C_keysight"].to_numpy(float) * C_FACTORS[C_UNIT]
-gk = data["G_keysight"].to_numpy(float) * G_FACTORS[G_UNIT]
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
 
-cv = data["C_v93k"].to_numpy(float) * C_FACTORS[C_UNIT]
-gv = data["G_v93k"].to_numpy(float) * G_FACTORS[G_UNIT]
+C_K = data["C_keysight"].to_numpy(dtype=float)
+G_K = data["G_keysight"].to_numpy(dtype=float)
 
-# Complex admittances in nS
-YK = gk + 1j * B_PER_PF * ck
-YV = gv + 1j * B_PER_PF * cv
+C_V = data["C_v93k"].to_numpy(dtype=float)
+G_V = data["G_v93k"].to_numpy(dtype=float)
 
-if not (np.isfinite(YK).all() and np.isfinite(YV).all()):
-    raise ValueError("Nonfinite measurement")
+# Complex admittance [S]
+Y_K = G_K + 1j * OMEGA * C_K
+Y_V = G_V + 1j * OMEGA * C_V
 
-# Hold out entire H/L combinations.
-# This tests generalization to unseen configurations.
-def parse_pins(x):
-    if isinstance(x, str):
+if not (
+    np.isfinite(Y_K).all()
+    and np.isfinite(Y_V).all()
+):
+    raise ValueError("Nonfinite C/G data")
+
+
+def parse_pins(value):
+    if isinstance(value, str):
         try:
-            x = ast.literal_eval(x)
+            value = ast.literal_eval(value)
         except (ValueError, SyntaxError):
-            x = re.findall(r"\d+", x)
+            value = re.findall(r"\d+", value)
 
-    return tuple(sorted(map(int, x)))
+    if isinstance(value, (int, np.integer)):
+        value = [value]
 
-if {"high_pins", "low_pins"}.issubset(data.columns):
-    GROUPS = np.array([
-        str((parse_pins(h), parse_pins(l)))
-        for h, l in zip(
-            data["high_pins"], data["low_pins"]
-        )
-    ])
-else:
-    raise ValueError(
-        "For grouped CV, provide high_pins and low_pins"
-    )
+    pins = tuple(sorted(int(p) for p in value))
 
-# ==========================================================
-# COMPLEX CORRECTION
+    if not pins:
+        raise ValueError("Empty pin selection")
+
+    if len(set(pins)) != len(pins):
+        raise ValueError("Duplicate pins")
+
+    return pins
+
+
+HIGH = [
+    parse_pins(x) for x in data["high_pins"]
+]
+
+LOW = [
+    parse_pins(x) for x in data["low_pins"]
+]
+
+GROUPS = np.array([
+    str((h, l))
+    for h, l in zip(HIGH, LOW)
+])
+
+N = len(data)
+
+print("Rows:", N)
+print("Configurations:", len(np.unique(GROUPS)))
+
+print("\n=== MEASUREMENT RANGE (SI) ===")
+print("Keysight C [F]:", C_K.min(), C_K.max())
+print("V93K C [F]:", C_V.min(), C_V.max())
+print("Keysight G [S]:", G_K.min(), G_K.max())
+print("V93K G [S]:", G_V.min(), G_V.max())
+
+
+# ============================================================
+# 2. PARAMETERIZATION
 #
-# Zs in MOhm, Y in nS.
-# Zs * Y requires factor 1e-3.
-# ==========================================================
+# Optimizer variables x are DIMENSIONLESS.
+#
+# Physical parameters:
+#   Zs [Ohm]
+#   Yp [S]
+#
+# This keeps numerical derivatives stable without
+# changing physical calculation units.
+# ============================================================
 
-def decode_params(theta, mode):
+def physical_params(x, mode):
     if mode == "Identity":
         return 0j, 0j
 
     if mode == "Open-offset":
-        yp = theta[0] + 1j * theta[1]
+        yp = (
+            x[0] + 1j*x[1]
+        ) * YP_REF_S
+
         return 0j, yp
 
     if mode == "Series-only":
-        zs = theta[0] + 1j * theta[1]
+        zs = (
+            x[0] + 1j*x[1]
+        ) * Z_REF_OHM
+
         return zs, 0j
 
     if mode == "Series+Shunt":
-        zs = theta[0] + 1j * theta[1]
-        yp = theta[2] + 1j * theta[3]
+        zs = (
+            x[0] + 1j*x[1]
+        ) * Z_REF_OHM
+
+        yp = (
+            x[2] + 1j*x[3]
+        ) * YP_REF_S
+
         return zs, yp
 
     raise ValueError(mode)
 
 
-def correct_y(yv, theta, mode):
-    zs, yp = decode_params(theta, mode)
+def parameter_bounds(mode):
+    if mode == "Identity":
+        return np.array([]), np.array([])
 
-    denominator = 1 - 1e-3 * zs * yv
+    z_limit = Z_BOUND_OHM / Z_REF_OHM
+    y_limit = YP_BOUND_S / YP_REF_S
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        y_corrected = yv / denominator - yp
+    if mode == "Open-offset":
+        upper = np.array([y_limit, y_limit])
 
-    return y_corrected
+    elif mode == "Series-only":
+        upper = np.array([z_limit, z_limit])
+
+    else:
+        upper = np.array([
+            z_limit, z_limit,
+            y_limit, y_limit
+        ])
+
+    return -upper, upper
 
 
-# ==========================================================
-# OBJECTIVE
-# ==========================================================
+# ============================================================
+# 3. CORRECTION MODEL
+#
+# All admittances: S
+# All impedances: Ohm
+#
+# Ycorrected = Yv/(1-Zs*Yv) - Yp
+# ============================================================
 
-def residual(indices, theta, mode):
-    yp = correct_y(YV[indices], theta, mode)
+def correct_y(yv, x, mode):
+    zs, yp = physical_params(x, mode)
 
-    if not np.isfinite(yp).all():
-        return np.full(2 * len(indices), 1e8)
+    denominator = 1.0 - zs*yv
 
-    dc = (yp.imag - YK[indices].imag) / B_PER_PF
-    dg = yp.real - YK[indices].real
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore"
+    ):
+        corrected = yv / denominator - yp
 
-    # Penalize near-singular inversions.
-    zs, _ = decode_params(theta, mode)
-    denominator = 1 - 1e-3 * zs * YV[indices]
+    return corrected
 
-    if np.min(np.abs(denominator)) < 0.05:
-        return np.full(2 * len(indices), 1e8)
+
+# ============================================================
+# 4. OBJECTIVE
+#
+# Residuals are dimensionless:
+#   C_error [F] / C_SCALE_F
+#   G_error [S] / G_SCALE_S
+# ============================================================
+
+def residual(indices, x, mode):
+    yv = Y_V[indices]
+
+    zs, _ = physical_params(x, mode)
+    denominator = 1.0 - zs*yv
+
+    if (
+        not np.isfinite(denominator).all()
+        or np.any(np.abs(denominator) < MIN_DENOMINATOR)
+    ):
+        return np.full(2*len(indices), 1e8)
+
+    yc = correct_y(yv, x, mode)
+
+    if not np.isfinite(yc).all():
+        return np.full(2*len(indices), 1e8)
+
+    error_c = (yc.imag - Y_K[indices].imag) / OMEGA
+    error_g = yc.real - Y_K[indices].real
 
     return np.r_[
-        dc / C_SCALE_PF,
-        dg / G_SCALE_NS
+        error_c / C_SCALE_F,
+        error_g / G_SCALE_S
     ]
 
 
+# ============================================================
+# 5. FIT
+# ============================================================
+
 def fit_model(indices, mode):
     if mode == "Identity":
-        return np.array([])
+        return np.array([], dtype=float)
 
-    n = 4 if mode == "Series+Shunt" else 2
+    lower, upper = parameter_bounds(mode)
 
-    # Bounds follow parameter order.
-    if mode == "Series+Shunt":
-        bound = np.array([
-            ZS_BOUND_MOHM, ZS_BOUND_MOHM,
-            YP_BOUND_NS, YP_BOUND_NS
-        ])
-    elif mode == "Open-offset":
-        bound = np.array([
-            YP_BOUND_NS, YP_BOUND_NS
-        ])
-    else:
-        bound = np.array([
-            ZS_BOUND_MOHM, ZS_BOUND_MOHM
-        ])
+    n = len(lower)
 
     starts = [np.zeros(n)]
 
@@ -185,95 +270,114 @@ def fit_model(indices, mode):
         x[0] = 1.0
         starts.append(x)
 
-    fitted = []
+        x = np.zeros(n)
+        x[1] = -1.0
+        starts.append(x)
+
+    results = []
 
     for start in starts:
         opt = least_squares(
-            lambda t: residual(indices, t, mode),
+            lambda x: residual(indices, x, mode),
             start,
-            bounds=(-bound, bound),
+            bounds=(lower, upper),
             loss="soft_l1",
             f_scale=1.0,
-            max_nfev=800,
+            max_nfev=MAX_NFEV,
             x_scale="jac"
         )
 
-        fitted.append(opt)
+        results.append(opt)
 
-    return min(fitted, key=lambda o: o.cost).x
+    best = min(results, key=lambda o: o.cost)
+
+    return best.x
 
 
-# ==========================================================
-# EVALUATION
-# ==========================================================
+# ============================================================
+# 6. EVALUATION - RAW SI VALUES
+# ============================================================
 
-def evaluate(indices, theta, mode):
-    yp = correct_y(YV[indices], theta, mode)
+def evaluate(indices, x, mode):
+    yc = correct_y(Y_V[indices], x, mode)
 
-    c_pred = yp.imag / B_PER_PF
-    g_pred = yp.real
+    c_pred = yc.imag / OMEGA
+    g_pred = yc.real
 
-    c_actual = YK[indices].imag / B_PER_PF
-    g_actual = YK[indices].real
-
-    ec = (c_pred - c_actual) * 1000
-    eg = g_pred - g_actual
+    ec = c_pred - C_K[indices]
+    eg = g_pred - G_K[indices]
 
     return {
-        "C_RMSE_fF": np.sqrt(np.mean(ec**2)),
-        "C_MAE_fF": np.mean(np.abs(ec)),
-        "G_RMSE_nS": np.sqrt(np.mean(eg**2)),
-        "G_MAE_nS": np.mean(np.abs(eg))
+        "C_RMSE_F": float(
+            np.sqrt(np.mean(ec**2))
+        ),
+        "C_MAE_F": float(
+            np.mean(np.abs(ec))
+        ),
+        "C_Bias_F": float(
+            np.mean(ec)
+        ),
+        "G_RMSE_S": float(
+            np.sqrt(np.mean(eg**2))
+        ),
+        "G_MAE_S": float(
+            np.mean(np.abs(eg))
+        )
     }
 
 
-# ==========================================================
-# GROUPED CROSS VALIDATION
-# ==========================================================
+# ============================================================
+# 7. GROUPED CROSS VALIDATION
+# ============================================================
 
 rows = []
 param_rows = []
 
-cv_splitter = GroupShuffleSplit(
+splitter = GroupShuffleSplit(
     n_splits=N_FOLDS,
     test_size=TEST_SIZE,
     random_state=SEED
 )
 
 for fold, (train, test) in enumerate(
-    cv_splitter.split(YV, groups=GROUPS),
+    splitter.split(np.arange(N), groups=GROUPS),
     start=1
 ):
     for mode in MODELS:
-        theta = fit_model(train, mode)
+        x = fit_model(train, mode)
 
-        train_score = evaluate(train, theta, mode)
-        test_score = evaluate(test, theta, mode)
+        train_score = evaluate(train, x, mode)
+        test_score = evaluate(test, x, mode)
 
-        zs, yp = decode_params(theta, mode)
+        zs, yp = physical_params(x, mode)
 
         rows.append({
             "Fold": fold,
             "Model": mode,
-            "Train_C_RMSE_fF": train_score["C_RMSE_fF"],
+            "Train_C_RMSE_F":
+                train_score["C_RMSE_F"],
             **test_score
         })
 
         param_rows.append({
             "Fold": fold,
             "Model": mode,
-            "Zs_real_MOhm": zs.real,
-            "Zs_imag_MOhm": zs.imag,
-            "Yp_real_nS": yp.real,
-            "Yp_imag_nS": yp.imag
+            "Zs_real_Ohm": float(zs.real),
+            "Zs_imag_Ohm": float(zs.imag),
+            "Yp_real_S": float(yp.real),
+            "Yp_imag_S": float(yp.imag)
         })
 
         print(
-            f"Fold {fold} {mode:14} "
-            f"C RMSE={test_score['C_RMSE_fF']:.2f} fF "
-            f"G RMSE={test_score['G_RMSE_nS']:.4f} nS"
+            f"Fold {fold} | {mode:14} | "
+            f"C RMSE={test_score['C_RMSE_F']:.6e} F | "
+            f"G RMSE={test_score['G_RMSE_S']:.6e} S"
         )
 
+
+# ============================================================
+# 8. SUMMARY
+# ============================================================
 
 scores = pd.DataFrame(rows)
 params = pd.DataFrame(param_rows)
@@ -281,78 +385,112 @@ params = pd.DataFrame(param_rows)
 summary = (
     scores.groupby("Model")
     .agg(
-        C_RMSE_mean=("C_RMSE_fF", "mean"),
-        C_RMSE_std=("C_RMSE_fF", "std"),
-        G_RMSE_mean=("G_RMSE_nS", "mean"),
-        G_RMSE_std=("G_RMSE_nS", "std"),
-        Train_C_RMSE=("Train_C_RMSE_fF", "mean")
+        C_RMSE_mean_F=("C_RMSE_F", "mean"),
+        C_RMSE_std_F=("C_RMSE_F", "std"),
+        C_MAE_mean_F=("C_MAE_F", "mean"),
+        G_RMSE_mean_S=("G_RMSE_S", "mean"),
+        G_RMSE_std_S=("G_RMSE_S", "std"),
+        Train_C_RMSE_mean_F=("Train_C_RMSE_F", "mean")
     )
-    .sort_values("C_RMSE_mean")
+    .sort_values("C_RMSE_mean_F")
 )
 
-print("\n=== DUT COMPLEX Y CALIBRATION ===")
-print(summary.round(4).to_string())
+print("\n=== CALIBRATION COMPARISON ===")
+print(summary.to_string(float_format=lambda x: f"{x:.6e}"))
 
 print("\n=== PARAMETER STABILITY ===")
 print(
     params.groupby("Model")[
         [
-            "Zs_real_MOhm",
-            "Zs_imag_MOhm",
-            "Yp_real_nS",
-            "Yp_imag_nS"
+            "Zs_real_Ohm",
+            "Zs_imag_Ohm",
+            "Yp_real_S",
+            "Yp_imag_S"
         ]
-    ].agg(["mean", "std"]).round(6).to_string()
+    ].agg(["mean", "std"])
+    .to_string(float_format=lambda x: f"{x:.6e}")
 )
 
 
-# ==========================================================
-# FULL-DATA FIT
-# ==========================================================
-
-all_idx = np.arange(len(YV))
+# ============================================================
+# 9. FINAL FIT ON ALL ROWS
+# ============================================================
 
 final_models = {}
 
-for mode in MODELS:
-    theta = fit_model(all_idx, mode)
+all_idx = np.arange(N)
 
-    zs, yp = decode_params(theta, mode)
+for mode in MODELS:
+    x = fit_model(all_idx, mode)
+
+    zs, yp = physical_params(x, mode)
 
     final_models[mode] = {
-        "theta": theta,
-        "Zs_MOhm": zs,
-        "Yp_nS": yp
+        "x": x,
+        "Zs_Ohm": zs,
+        "Yp_S": yp
     }
 
-    print(
-        mode,
-        "Zs =", zs,
-        "Yp =", yp
-    )
+    print(f"\n{mode}")
+    print(f"  Zs [Ohm] = {zs:.8e}")
+    print(f"  Yp [S]   = {yp:.8e}")
 
 
-# ==========================================================
-# CORRECT V93K TO KEYSIGHT-EQUIVALENT C/G
-# ==========================================================
+# ============================================================
+# 10. PREDICT KEYSIGHT-EQUIVALENT C/G
+#
+# Inputs:
+#   C_v93k [F]
+#   G_v93k [S]
+#
+# Outputs:
+#   C_corrected [F]
+#   G_corrected [S]
+# ============================================================
 
-def predict_keysight(c_v93k, g_v93k, mode="Series+Shunt"):
-    theta = final_models[mode]["theta"]
+def predict_keysight(
+    c_v93k,
+    g_v93k,
+    mode="Series+Shunt"
+):
+    x = final_models[mode]["x"]
 
-    yv = (
-        np.asarray(g_v93k) * G_FACTORS[G_UNIT]
-        + 1j * B_PER_PF
-        * np.asarray(c_v93k) * C_FACTORS[C_UNIT]
-    )
+    c = np.asarray(c_v93k, dtype=float)
+    g = np.asarray(g_v93k, dtype=float)
 
-    yp = correct_y(yv, theta, mode)
+    yv = g + 1j*OMEGA*c
 
-    c_corrected_pf = yp.imag / B_PER_PF
-    g_corrected_ns = yp.real
+    yc = correct_y(yv, x, mode)
 
-    return c_corrected_pf, g_corrected_ns
+    return yc.imag / OMEGA, yc.real
 
 
-scores.to_csv("dut_calibration_folds.csv", index=False)
-params.to_csv("dut_calibration_parameters.csv", index=False)
-summary.to_csv("dut_calibration_summary.csv")
+# ============================================================
+# 11. SAVE
+# ============================================================
+
+scores.to_csv(
+    "dut_calibration_folds_SI.csv",
+    index=False
+)
+
+params.to_csv(
+    "dut_calibration_parameters_SI.csv",
+    index=False
+)
+
+summary.to_csv(
+    "dut_calibration_summary_SI.csv"
+)
+
+import joblib
+
+joblib.dump(
+    {
+        "frequency_hz": FREQ_HZ,
+        "models": final_models,
+        "Z_ref_Ohm": Z_REF_OHM,
+        "Yp_ref_S": YP_REF_S
+    },
+    "dut_calibration_SI.joblib"
+)
