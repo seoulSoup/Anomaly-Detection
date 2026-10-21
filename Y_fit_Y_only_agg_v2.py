@@ -368,3 +368,44 @@ summary.to_csv(
 coeff_df.to_csv(
     "pair_aggregation_coefficients.csv", index=False
 )
+
+===============
+
+import numpy as np
+
+ref = PAIR_FEATURES["Sum"]
+
+print("=== Feature differences from Sum ===")
+
+for mode, xp in PAIR_FEATURES.items():
+    diff = xp - ref
+
+    print(
+        f"{mode:12}",
+        "max_diff =", np.max(np.abs(diff)),
+        "different_rows =",
+        np.sum(np.any(np.abs(diff) > 1e-10, axis=1))
+    )
+
+print("\n=== Pair multiplicity ===")
+
+for z, name in enumerate(ZONE_NAMES):
+    s = PAIR_FEATURES["Sum"][:, z]
+    m = PAIR_FEATURES["MaxPerPin"][:, z]
+
+    print(
+        f"{name:8}",
+        "Sum > Max rows =",
+        np.sum(s > m + 1e-10),
+        "Max difference =",
+        np.max(s - m)
+    )
+
+print("\n=== Fold scores ===")
+print(
+    score_df.pivot_table(
+        index=["Split", "Fold"],
+        columns="Model",
+        values="RMSE_fF"
+    ).round(6).to_string()
+)
