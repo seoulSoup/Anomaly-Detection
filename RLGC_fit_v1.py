@@ -26,7 +26,9 @@ CFG = dict(
     screen_maxiter=35, final_maxiter=250, refit_maxiter=400,
     top_k=16, folds=3, screen_starts=1, final_starts=3,
     # Optional: constrain explored candidates for faster iteration.
-    families=('pair', 'pair_smu', 'pin', 'pin_smu'),
+    families=('pair', 'pair_smu', 'pin', 'pin_smu', 'pair_cap', 'pin_cap'),
+    cap_aggregations=('sum','mean','maxpin','sqrt','partial'),
+    cap_ref_f=1e-12, cap_bound_f=1e-10, cap_regularization=1e-5,
     aggregations=('sum','mean','parallel','series','sqrt','partial','maxpin'),
     t_aggregations=('count','y0_weighted'),
     # Both ways to define branch electrical length
@@ -143,9 +145,52 @@ def _pin_features(highs,lows,mode):
     return X
 
 
+def _cap_features(highs,lows,aggregation):
+    """Independent C increments [F], by same-SMU pair zone and ordered H/L SMU combinations.
+
+    Columns 0..23: (same SMU g, zone even/odd/dist2/far), pair incidences.
+    Columns 24..59: ordered (high SMU, low SMU), at most one activation per group pair.
+    Aggregation applies to the pair-zone counts ONLY; SMU-presence increments
+    always remain binary. Coefficients are signed and fitted jointly with RLGC.
+    """
+    n=len(highs)
+    X=np.zeros((n,60),dtype=float)
+    for i,(hh,ll) in enumerate(zip(highs,lows)):
+        group_h={SMU_OF[p] for p in hh}
+        group_l={SMU_OF[p] for p in ll}
+        for gh in group_h:
+            for gl in group_l:
+                X[i,24+6*gh+gl]=1.0
+        for h in hh:
+            for l in ll:
+                if SMU_OF[h]==SMU_OF[l]:
+                    X[i,4*SMU_OF[h]+_pair_zone(h,l)]+=1.0
+    pair=X[:,:24]
+    if aggregation=='sum': pass
+    elif aggregation=='maxpin': np.minimum(pair,1.0,out=pair)
+    elif aggregation=='sqrt': np.sqrt(pair,out=pair)
+    elif aggregation=='partial': pair[:]=0.25*pair+0.75*np.minimum(pair,1.0)
+    elif aggregation=='mean':
+        # Normalize zone counts by total H-L pair count in that SMU.
+        for g,smu in enumerate(SMUS):
+            nh=np.array([sum(p in hh for p in smu) for hh in highs],dtype=float)
+            nl=np.array([sum(p in ll for p in smu) for ll in lows],dtype=float)
+            denom=np.maximum(nh*nl,1.0)
+            pair[:,4*g:4*g+4]/=denom[:,None]
+    else: raise ValueError(f'Unknown cap aggregation: {aggregation}')
+    return X
+
+
+def _make_cap_feature(highs,lows,family,cap_agg):
+    if not family.endswith('_cap'): return np.zeros((len(highs),0)),np.array([],dtype=int)
+    X=_cap_features(highs,lows,cap_agg)
+    active=np.flatnonzero(np.any(X!=0,axis=0))
+    return X[:,active],active
+
+
 def _make_feature(highs,lows,family,aggregation):
-    X=(_pair_features(highs,lows,family) if family.startswith('pair')
-       else _pin_features(highs,lows,family))
+    X=(_pair_features(highs,lows,'pair' if family=='pair_cap' else family) if family.startswith('pair')
+       else _pin_features(highs,lows,'pin' if family=='pin_cap' else family))
     # Group-level aggregation weights, not a linear regression surrogate.
     # maxpin operates on branch incidence saturation, preserving zone groups.
     if aggregation=='maxpin': X=np.minimum(X,1.0)
@@ -155,8 +200,8 @@ def _make_feature(highs,lows,family,aggregation):
 
 
 def _assemble_feature(highs,lows,family,aggregation,active):
-    X=(_pair_features(highs,lows,family) if family.startswith('pair')
-       else _pin_features(highs,lows,family))
+    X=(_pair_features(highs,lows,'pair' if family=='pair_cap' else family) if family.startswith('pair')
+       else _pin_features(highs,lows,'pin' if family=='pin_cap' else family))
     if aggregation=='maxpin': X=np.minimum(X,1.0)
     return X[:,active]
 
@@ -174,7 +219,7 @@ def _parameter_init(m,t_model,offset,cfg):
     return v,anchor,n_len
 
 
-def _predict_torch(v,X,YV,cfg,metadata):
+def _predict_torch(v,X,YV,cfg,metadata,XC=None):
     """Differentiable complex RLGC transmission transformation.
     Branch RLGC -> Z0 and tanh(gamma*l); aggregate branch characteristic
     admittances into effective Y0, and average/weighted-average branch t.
@@ -219,6 +264,11 @@ def _predict_torch(v,X,YV,cfg,metadata):
         # physical offset remains S
         tail=v[4*m+metadata['n_len']:]
         result=result+(tail[0]+1j*tail[1])*1e-10
+    if metadata.get('n_cap',0):
+        if XC is None: raise ValueError('Cap feature matrix is required')
+        cap_start=4*m+metadata['n_len']+(2 if metadata['offset']=='global' else 0)
+        cap_coeff=v[cap_start:cap_start+metadata['n_cap']]*cfg['cap_ref_f']
+        result=result+1j*w*(XC@cap_coeff)
     return result
 
 
@@ -273,17 +323,23 @@ def _normalized_objective_numpy(actual,pred,w,names,stats,cfg):
 
 
 def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1,
-         c_stds=None,g_stds=None):
+         c_stds=None,g_stds=None,XCnp=None):
     n,m=Xnp.shape
     if m==0: return None
     dtype=cfg['dtype']; cdtype=torch.complex128
     X=torch.as_tensor(Xnp,dtype=dtype)
     YV=torch.as_tensor(yv_np,dtype=cdtype)
     YK=torch.as_tensor(yk_np,dtype=cdtype)
+    XC=torch.as_tensor(XCnp,dtype=dtype) if XCnp is not None else None
     x0,anchor,nlen=_parameter_init(m,metadata['t_model'],metadata['offset'],cfg)
     md=dict(metadata,anchor=torch.as_tensor(anchor,dtype=dtype),n_len=nlen,n_features=m)
     bounds=[(-cfg['log_halfwidth'],cfg['log_halfwidth'])]*(4*m+nlen)
     if metadata['offset']=='global': bounds.extend([(-1e4,1e4)]*2)
+    ncap=metadata.get('n_cap',0)
+    if ncap:
+        x0=np.r_[x0,np.zeros(ncap)]
+        limit=cfg['cap_bound_f']/cfg['cap_ref_f']
+        bounds.extend([(-limit,limit)]*ncap)
     rng=np.random.default_rng(seed)
     best=None
     if c_stds is None: raise ValueError('Missing training-only C stds')
@@ -292,7 +348,7 @@ def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1,
 
     def fun_grad(q):
         v=torch.tensor(q,dtype=dtype,requires_grad=True)
-        pred=_predict_torch(v,X,YV,cfg,md)
+        pred=_predict_torch(v,X,YV,cfg,md,XC)
         err_c=(pred.imag-YK.imag)/(2*np.pi*cfg['freq_hz'])/SC
         loss=_smooth_mean_max(err_c,cfg)
         if cfg['g_loss_weight']:
@@ -300,6 +356,8 @@ def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1,
             loss=loss+cfg['g_loss_weight']*_smooth_mean_max(err_g,cfg)
         # Small log ridge to avoid unconstrained degrees of freedom
         loss=loss+cfg['log_regularization']*torch.mean(v[:4*m]**2)
+        if ncap:
+            loss=loss+cfg['cap_regularization']*torch.mean(v[-ncap:]**2)
         loss.backward()
         val=float(loss.detach().cpu())
         jac=v.grad.detach().cpu().numpy().copy()
@@ -319,12 +377,13 @@ def _fit(Xnp, yv_np, yk_np, metadata,cfg,maxiter,seed=0,starts=1,
     return fitted
 
 
-def _predict_numpy(model,Xnp,yv_np,cfg):
+def _predict_numpy(model,Xnp,yv_np,cfg,XCnp=None):
     X=torch.as_tensor(Xnp,dtype=cfg['dtype'])
     YV=torch.as_tensor(yv_np,dtype=torch.complex128)
+    XC=torch.as_tensor(XCnp,dtype=cfg['dtype']) if XCnp is not None else None
     md=dict(model,anchor=torch.as_tensor(model['anchor'],dtype=cfg['dtype']))
     with torch.no_grad():
-        yp=_predict_torch(torch.tensor(model['theta'],dtype=cfg['dtype']),X,YV,cfg,md)
+        yp=_predict_torch(torch.tensor(model['theta'],dtype=cfg['dtype']),X,YV,cfg,md,XC)
     return yp.numpy()
 
 
@@ -348,8 +407,10 @@ def run_rlgc_search(df,**overrides):
     info=_build_data(df,cfg)
     out=Path(cfg['out_dir']);out.mkdir(parents=True,exist_ok=True)
     n=info['n'];yv=info['yv'];yk=info['yk'];w=info['w'];groups=info['groups'];para=info['para']
-    specs=list(product(cfg['families'],cfg['aggregations'],
-                       cfg['t_aggregations'],cfg['t_models'],cfg['offsets']))
+    specs=[(family,agg,tagg,tm,offset,capagg)
+           for family in cfg['families']
+           for agg,tagg,tm,offset in product(cfg['aggregations'],cfg['t_aggregations'],cfg['t_models'],cfg['offsets'])
+           for capagg in (cfg['cap_aggregations'] if family.endswith('_cap') else ('none',))]
     if cfg['max_candidates'] is not None: specs=specs[:cfg['max_candidates']]
     print(f'Rows={n}, distinct configurations={len(set(groups))}, candidates={len(specs)}',flush=True)
     tr,te=next(GroupShuffleSplit(n_splits=1,test_size=cfg['test_fraction'],
@@ -357,22 +418,26 @@ def run_rlgc_search(df,**overrides):
     screen_stats=_train_std_stats(yk,para,tr,cfg)
     screen_sc,screen_sg=_row_std(screen_stats,para[tr])
     screen=[];start=time.time()
-    for idx,(family,agg,tagg,tm,offset) in enumerate(specs):
+    for idx,(family,agg,tagg,tm,offset,capagg) in enumerate(specs):
         X,active=_make_feature(info['highs'],info['lows'],family,agg)
+        XC,cap_active=_make_cap_feature(info['highs'],info['lows'],family,capagg)
         metadata=dict(family=family,aggregation=agg,t_aggregation=tagg,
-                      t_model=tm,offset=offset,active=active)
+                      t_model=tm,offset=offset,active=active,cap_aggregation=capagg,
+                      cap_active=cap_active,n_cap=XC.shape[1])
         try:
             fitted=_fit(X[tr],yv[tr],yk[tr],metadata,cfg,
                         cfg['screen_maxiter'],seed=cfg['seed'],starts=cfg['screen_starts'],
-                        c_stds=screen_sc,g_stds=screen_sg)
-            yp=_predict_numpy(fitted,X[te],yv[te],cfg)
+                        c_stds=screen_sc,g_stds=screen_sg,XCnp=XC[tr])
+            yp=_predict_numpy(fitted,X[te],yv[te],cfg,XC[te])
             m=_score(yk[te],yp,w,cfg)
             m['NormalizedObjective']=_normalized_objective_numpy(yk[te],yp,w,para[te],screen_stats,cfg)
         except Exception as exc:
             m=dict(C_RMSE_F=np.inf,C_MAE_F=np.inf,G_RMSE_S=np.inf,G_MAE_S=np.inf,Combined=np.inf)
-            print('ERROR',idx,family,agg,tagg,tm,offset,str(exc)[:100],flush=True)
+            print('ERROR',idx,family,agg,tagg,tm,offset,capagg,str(exc)[:100],flush=True)
+        if 'NormalizedObjective' not in m: m['NormalizedObjective']=np.inf
         screen.append(dict(id=idx,Family=family,Aggregation=agg,T_aggregation=tagg,
-                           T_model=tm,Offset=offset,Params=4*len(active),**m))
+                           T_model=tm,Offset=offset,Cap_aggregation=capagg,
+                           Params=4*len(active)+len(cap_active),**m))
         if (idx+1)%10==0:
             print(f'Screen {idx+1}/{len(specs)} | best C RMSE=' 
                   f'{min(x["C_RMSE_F"] for x in screen):.6e} F | '
@@ -389,39 +454,43 @@ def run_rlgc_search(df,**overrides):
         fold_stats=_train_std_stats(yk,para,train,cfg)
         fold_sc,fold_sg=_row_std(fold_stats,para[train])
         for i in top_ids:
-            family,agg,tagg,tm,offset=specs[i]
+            family,agg,tagg,tm,offset,capagg=specs[i]
             X,active=_make_feature(info['highs'],info['lows'],family,agg)
+            XC,cap_active=_make_cap_feature(info['highs'],info['lows'],family,capagg)
             meta=dict(family=family,aggregation=agg,t_aggregation=tagg,
-                      t_model=tm,offset=offset,active=active)
+                      t_model=tm,offset=offset,active=active,cap_aggregation=capagg,
+                      cap_active=cap_active,n_cap=XC.shape[1])
             try:
                 model=_fit(X[train],yv[train],yk[train],meta,cfg,cfg['final_maxiter'],
                            seed=cfg['seed']+fold,starts=cfg['final_starts'],
-                           c_stds=fold_sc,g_stds=fold_sg)
-                yp=_predict_numpy(model,X[test],yv[test],cfg)
+                           c_stds=fold_sc,g_stds=fold_sg,XCnp=XC[train])
+                yp=_predict_numpy(model,X[test],yv[test],cfg,XC[test])
                 ms=_score(yk[test],yp,w,cfg)
                 ms['NormalizedObjective']=_normalized_objective_numpy(yk[test],yp,w,para[test],fold_stats,cfg)
             except Exception as exc:
                 print('FINAL ERROR',i,str(exc)[:100],flush=True)
                 ms=dict(C_RMSE_F=np.inf,C_MAE_F=np.inf,G_RMSE_S=np.inf,G_MAE_S=np.inf,Combined=np.inf,NormalizedObjective=np.inf)
             fold_rows.append(dict(id=i,Fold=fold,Family=family,Aggregation=agg,
-                                  T_aggregation=tagg,T_model=tm,Offset=offset,**ms))
+                                  T_aggregation=tagg,T_model=tm,Offset=offset,Cap_aggregation=capagg,**ms))
             print(f'Final fold {fold} id {i}: C={ms["C_RMSE_F"]:.6e} F, '
                   f'G={ms["G_RMSE_S"]:.6e} S',flush=True)
     folds=pd.DataFrame(fold_rows);folds.to_csv(out/'folds.csv',index=False)
-    ranking=(folds.groupby(['id','Family','Aggregation','T_aggregation','T_model','Offset'])
+    ranking=(folds.groupby(['id','Family','Aggregation','T_aggregation','T_model','Offset','Cap_aggregation'])
              [['C_RMSE_F','C_MAE_F','G_RMSE_S','G_MAE_S','Combined','NormalizedObjective']]
              .mean().reset_index().sort_values(['NormalizedObjective','C_RMSE_F']))
     ranking.to_csv(out/'ranking.csv',index=False)
     print('\n=== VALIDATION RANKING ===\n',ranking.to_string(index=False),flush=True)
     best_id=int(ranking.iloc[0]['id'])
-    family,agg,tagg,tm,offset=specs[best_id]
+    family,agg,tagg,tm,offset,capagg=specs[best_id]
     X,active=_make_feature(info['highs'],info['lows'],family,agg)
-    meta=dict(family=family,aggregation=agg,t_aggregation=tagg,t_model=tm,offset=offset,active=active)
+    XC,cap_active=_make_cap_feature(info['highs'],info['lows'],family,capagg)
+    meta=dict(family=family,aggregation=agg,t_aggregation=tagg,t_model=tm,offset=offset,active=active,
+              cap_aggregation=capagg,cap_active=cap_active,n_cap=XC.shape[1])
     full_stats=_train_std_stats(yk,para,np.arange(n),cfg)
     full_sc,full_sg=_row_std(full_stats,para)
     model=_fit(X,yv,yk,meta,cfg,cfg['refit_maxiter'],seed=cfg['seed']+999,
-               starts=max(cfg['final_starts'],3),c_stds=full_sc,g_stds=full_sg)
-    yp=_predict_numpy(model,X,yv,cfg)
+               starts=max(cfg['final_starts'],3),c_stds=full_sc,g_stds=full_sg,XCnp=XC)
+    yp=_predict_numpy(model,X,yv,cfg,XC)
     report=info['frame'].copy()
     report['C_pred_F']=yp.imag/w
     report['G_pred_S']=yp.real
@@ -449,7 +518,8 @@ def predict_rlgc(saved_path,df_new):
     X=_assemble_feature(highs,lows,model['family'],model['aggregation'],model['active'])
     w=2*np.pi*cfg['freq_hz']
     yv=data[cfg['g_v93k']].to_numpy(float)+1j*w*data[cfg['c_v93k']].to_numpy(float)
-    pred=_predict_numpy(model,X,yv,cfg)
+    XCfull=_cap_features(highs,lows,model.get('cap_aggregation','none'))[:,model['cap_active']] if model.get('n_cap',0) else None
+    pred=_predict_numpy(model,X,yv,cfg,XCfull)
     result=data.copy();result['C_pred_F']=pred.imag/w;result['G_pred_S']=pred.real
     return result
 
